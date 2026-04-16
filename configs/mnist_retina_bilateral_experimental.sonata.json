@@ -1,0 +1,365 @@
+{
+  "network_name": "MNISTRetinaBilateralExperimental",
+  "snnframe": {
+    "classification": {
+      "type": "weighted_distance",
+      "k": 7,
+      "distance_exponent": 1.0,
+      "string_params": {
+        "fusion_mode": "bilateral",
+        "stage1_strategy": "majority",
+        "fusion_strategy": "corpus_callosum",
+        "fusion_feature_mode": "interaction",
+        "fusion_path": "Interhemispheric Bridge/Association Lobe/Corpus Callosum Region/Corpus Callosum Nucleus/Fusion Column/Fusion",
+        "input_domain": "mnist",
+        "input_variant": "digits"
+      },
+      "int_params": {
+        "stage1_k": 7,
+        "fusion_k": 7,
+        "fusion_holdout_per_class": 50,
+        "input_apply_transform": 0
+      },
+      "double_params": {
+        "stage1_distance_exponent": 1.0,
+        "fusion_distance_exponent": 1.0,
+        "corpus_vote_gain": 0.2,
+        "corpus_margin_gain": 0.5,
+        "corpus_centroid_gain": 0.1
+      }
+    },
+    "brain": {
+      "name": "Retina Bilateral Brain",
+      "hemispheres": [
+        {
+          "name": "Left Hemisphere",
+          "lobes": [
+            {
+              "name": "Occipital Lobe",
+              "regions": [
+                {
+                  "name": "Retina Region",
+                  "nuclei": [
+                    {
+                      "name": "Stage1 Nucleus",
+                      "columns": [
+                        {
+                          "name": "Multiscale Branches",
+                          "layers": [
+                            {
+                              "name": "SobelG9",
+                              "populations": [
+                                {
+                                  "name": "Branch",
+                                  "count": 1
+                                }
+                              ]
+                            },
+                            {
+                              "name": "SobelG10",
+                              "populations": [
+                                {
+                                  "name": "Branch",
+                                  "count": 1
+                                }
+                              ]
+                            },
+                            {
+                              "name": "DogG9",
+                              "populations": [
+                                {
+                                  "name": "Branch",
+                                  "count": 1
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "name": "Association Nucleus",
+                      "columns": [
+                        {
+                          "name": "Corpus Callosum",
+                          "layers": [
+                            {
+                              "name": "Fusion",
+                              "populations": [
+                                {
+                                  "name": "Decision",
+                                  "count": 1
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Right Hemisphere",
+          "lobes": [
+            {
+              "name": "Occipital Lobe",
+              "regions": [
+                {
+                  "name": "Retina Region",
+                  "nuclei": [
+                    {
+                      "name": "Stage1 Nucleus",
+                      "columns": [
+                        {
+                          "name": "Multiscale Branches",
+                          "layers": [
+                            {
+                              "name": "SobelG9",
+                              "populations": [
+                                {
+                                  "name": "Branch",
+                                  "count": 1
+                                }
+                              ]
+                            },
+                            {
+                              "name": "SobelG10",
+                              "populations": [
+                                {
+                                  "name": "Branch",
+                                  "count": 1
+                                }
+                              ]
+                            },
+                            {
+                              "name": "DogG9",
+                              "populations": [
+                                {
+                                  "name": "Branch",
+                                  "count": 1
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "name": "Association Nucleus",
+                      "columns": [
+                        {
+                          "name": "Corpus Callosum",
+                          "layers": [
+                            {
+                              "name": "Relay",
+                              "populations": [
+                                {
+                                  "name": "Decision",
+                                  "count": 1
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Interhemispheric Bridge",
+          "lobes": [
+            {
+              "name": "Association Lobe",
+              "regions": [
+                {
+                  "name": "Corpus Callosum Region",
+                  "nuclei": [
+                    {
+                      "name": "Corpus Callosum Nucleus",
+                      "columns": [
+                        {
+                          "name": "Fusion Column",
+                          "layers": [
+                            {
+                              "name": "Fusion",
+                              "populations": [
+                                {
+                                  "name": "Decision",
+                                  "count": 1
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "adapters": [
+      {
+        "name": "left_retina_g9",
+        "type": "retina",
+        "role": "sensory",
+        "temporal_window_ms": 200.0,
+        "int_params": {
+          "grid_size": 9,
+          "num_orientations": 8
+        },
+        "double_params": {
+          "edge_threshold": 0.22,
+          "neuron_window_size": 200.0,
+          "neuron_threshold": 0.7,
+          "rotation_deg": -2.0,
+          "shift_x_px": -0.35
+        },
+        "string_params": {
+          "edge_operator": "sobel",
+          "encoding_strategy": "rate",
+          "activation_mode": "binary",
+          "hemisphere": "left",
+          "attach_path": "Left Hemisphere/Occipital Lobe/Retina Region/Stage1 Nucleus/Multiscale Branches/SobelG9"
+        }
+      },
+      {
+        "name": "left_retina_g10",
+        "type": "retina",
+        "role": "sensory",
+        "temporal_window_ms": 200.0,
+        "int_params": {
+          "grid_size": 10,
+          "num_orientations": 8
+        },
+        "double_params": {
+          "edge_threshold": 0.24,
+          "neuron_window_size": 200.0,
+          "neuron_threshold": 0.7,
+          "rotation_deg": -1.0,
+          "shift_x_px": -0.25
+        },
+        "string_params": {
+          "edge_operator": "sobel",
+          "encoding_strategy": "rate",
+          "activation_mode": "binary",
+          "hemisphere": "left",
+          "attach_path": "Left Hemisphere/Occipital Lobe/Retina Region/Stage1 Nucleus/Multiscale Branches/SobelG10"
+        }
+      },
+      {
+        "name": "left_retina_dog_g9",
+        "type": "retina",
+        "role": "sensory",
+        "temporal_window_ms": 200.0,
+        "int_params": {
+          "grid_size": 9,
+          "num_orientations": 8
+        },
+        "double_params": {
+          "edge_threshold": 0.16,
+          "neuron_window_size": 200.0,
+          "neuron_threshold": 0.7,
+          "fusion_weight": 0.2,
+          "sigma1": 1.0,
+          "sigma2": 1.8,
+          "rotation_deg": -1.5,
+          "shift_x_px": -0.35
+        },
+        "string_params": {
+          "edge_operator": "dog",
+          "encoding_strategy": "rate",
+          "activation_mode": "binary",
+          "hemisphere": "left",
+          "attach_path": "Left Hemisphere/Occipital Lobe/Retina Region/Stage1 Nucleus/Multiscale Branches/DogG9"
+        }
+      },
+      {
+        "name": "right_retina_g9",
+        "type": "retina",
+        "role": "sensory",
+        "temporal_window_ms": 200.0,
+        "int_params": {
+          "grid_size": 9,
+          "num_orientations": 8
+        },
+        "double_params": {
+          "edge_threshold": 0.22,
+          "neuron_window_size": 200.0,
+          "neuron_threshold": 0.7,
+          "rotation_deg": 2.0,
+          "shift_x_px": 0.35
+        },
+        "string_params": {
+          "edge_operator": "sobel",
+          "encoding_strategy": "rate",
+          "activation_mode": "binary",
+          "hemisphere": "right",
+          "attach_path": "Right Hemisphere/Occipital Lobe/Retina Region/Stage1 Nucleus/Multiscale Branches/SobelG9"
+        }
+      },
+      {
+        "name": "right_retina_g10",
+        "type": "retina",
+        "role": "sensory",
+        "temporal_window_ms": 200.0,
+        "int_params": {
+          "grid_size": 10,
+          "num_orientations": 8
+        },
+        "double_params": {
+          "edge_threshold": 0.24,
+          "neuron_window_size": 200.0,
+          "neuron_threshold": 0.7,
+          "rotation_deg": 1.0,
+          "shift_x_px": 0.25
+        },
+        "string_params": {
+          "edge_operator": "sobel",
+          "encoding_strategy": "rate",
+          "activation_mode": "binary",
+          "hemisphere": "right",
+          "attach_path": "Right Hemisphere/Occipital Lobe/Retina Region/Stage1 Nucleus/Multiscale Branches/SobelG10"
+        }
+      },
+      {
+        "name": "right_retina_dog_g9",
+        "type": "retina",
+        "role": "sensory",
+        "temporal_window_ms": 200.0,
+        "int_params": {
+          "grid_size": 9,
+          "num_orientations": 8
+        },
+        "double_params": {
+          "edge_threshold": 0.16,
+          "neuron_window_size": 200.0,
+          "neuron_threshold": 0.7,
+          "fusion_weight": 0.2,
+          "sigma1": 1.0,
+          "sigma2": 1.8,
+          "rotation_deg": 1.5,
+          "shift_x_px": 0.35
+        },
+        "string_params": {
+          "edge_operator": "dog",
+          "encoding_strategy": "rate",
+          "activation_mode": "binary",
+          "hemisphere": "right",
+          "attach_path": "Right Hemisphere/Occipital Lobe/Retina Region/Stage1 Nucleus/Multiscale Branches/DogG9"
+        }
+      }
+    ]
+  }
+}

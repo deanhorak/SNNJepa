@@ -1,0 +1,9 @@
+build/
+Testing/
+data/
+*.log
+*.pid
+flow_audit_*.csv
+flow_audit_*.json
+.DS_Store
+compile_commands.json

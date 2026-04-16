@@ -1,0 +1,3 @@
+add_executable(retina_classification retina_classification.cpp)
+target_link_libraries(retina_classification PRIVATE snnfw)
+target_include_directories(retina_classification PRIVATE ${CMAKE_SOURCE_DIR}/include)
