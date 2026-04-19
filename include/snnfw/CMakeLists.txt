@@ -81,6 +81,9 @@ set(LIB_SOURCES
     experiment/SupervisedTeacher.cpp
     experiment/TrainingPipeline.cpp
     experiment/ExperimentRunner.cpp
+    jepa/JepaMaskSampler.cpp
+    jepa/JepaStateExtractor.cpp
+    jepa/JepaTrainer.cpp
 )
 
 # Create library

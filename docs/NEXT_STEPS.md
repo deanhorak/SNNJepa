@@ -2,6 +2,23 @@
 # NEXT_STEPS
 
 This document translates the lessons in `docs/RabbitHoles.md` into a practical working strategy for `SNNJepa`.
+## Current Status
+
+The repo now has the JEPA research plumbing needed for honest representation experiments:
+
+- stage-1 latent extraction is wired into the bilateral benchmark
+- masked visible/hidden branch sampling is implemented
+- no-leakage checks are enforced at export and training time
+- the JEPA trainer now uses a context encoder, predictor, and EMA target encoder
+- probe evaluation on frozen JEPA embeddings is implemented
+- temporal fixation targets are implemented and verified in smoke runs with real fixation diversity
+
+What this means in practice:
+
+- baseline parity is protected
+- JEPA probe results are real JEPA-driven measurements
+- current JEPA probe accuracy is still below the protected baselines
+- the next gains must come from better representation learning, not downstream readout tuning
 
 The goal is simple:
 

@@ -1,4 +1,5 @@
 build/
+build_*/
 Testing/
 data/
 *.log
@@ -7,3 +8,5 @@ flow_audit_*.csv
 flow_audit_*.json
 .DS_Store
 compile_commands.json
+.codex
+*.code-workspace

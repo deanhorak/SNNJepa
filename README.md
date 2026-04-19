@@ -84,9 +84,36 @@ This repo is not intended to chase surrogate-gradient or ANN-to-SNN conversion b
 - masked or partial-view prediction over spiking sensory state
 - object-centric recurrent state formation
 
+## Current Status
+
+The repo is now past the initial scaffolding phase.
+
+Implemented:
+- core framework relocation from `src/` into `include/snnfw/`
+- JEPA module surface under `include/snnfw/jepa/`
+- stage-1 latent tap extraction from the bilateral retina benchmark
+- masking sampler with visible/hidden branch splits and no-leakage checks
+- minimal JEPA trainer with explicit context encoder, predictor head, and EMA target encoder
+- JEPA probe evaluation path that measures classifier accuracy from frozen JEPA embeddings
+- temporal/fixation-aware JEPA targets via `jepa_target_mode=temporal_fixation`
+
+Verified so far:
+- retained baseline parity after the relocation:
+  - MNIST full: `96.88% (9688/10000)`
+  - EMNIST retained gate: `87.29% (4539/5200)`
+  - CIFAR-10 retained gate: `33.70% (337/1000)`
+- JEPA probe path is live and produces real JEPA-driven results rather than sidecar-only diagnostics
+- temporal JEPA training is active when configs include real fixation diversity; the latest smoke run produced nonzero temporal pairs and zero fallback masked examples
+
+Current interpretation:
+- the JEPA plumbing is valid
+- the frozen JEPA probe is not yet competitive with the protected baselines
+- the next work is representation improvement, not downstream classifier tuning
+
 See:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Baselines](docs/BASELINES.md)
 - [Development](docs/DEVELOPMENT.md)
 - [JEPA Roadmap](docs/JEPA_ROADMAP.md)
+- [JEPA Status](docs/JEPA_STATUS.md)
 - [Repository Layout](docs/REPO_LAYOUT.md)

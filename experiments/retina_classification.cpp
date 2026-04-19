@@ -5,6 +5,9 @@
 #include "snnfw/declarative/NativeJSONParser.h"
 #include "snnfw/declarative/SONATAParser.h"
 #include "snnfw/domain/VisualDomainAdapter.h"
+#include "snnfw/jepa/JepaConfig.h"
+#include "snnfw/jepa/JepaStateExtractor.h"
+#include "snnfw/jepa/JepaTrainer.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <array>
@@ -20,6 +23,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <random>
 #include <numeric>
 #include <set>
@@ -45,6 +49,8 @@ using snnfw::declarative::SONATAParser;
 using snnfw::domain::VisualDomainAdapter;
 using snnfw::domain::VisualDomainConfig;
 using snnfw::domain::VisualStimulus;
+using snnfw::jepa::JepaConfig;
+using snnfw::jepa::Stage1TapInput;
 
 using IndexBuckets = std::vector<std::vector<size_t>>;
 using IntMatrix = std::vector<std::vector<int>>;
@@ -221,6 +227,14 @@ struct Config {
     bool flowAuditEnabled = false;
     int flowAuditSampleLimit = 0;
     std::string flowAuditOutputPrefix;
+    JepaConfig jepa;
+};
+
+struct JepaProbeResult {
+    IntMatrix confusion;
+    int correct = 0;
+    int tested = 0;
+    double seconds = 0.0;
 };
 
 struct ObjectStateAttractor {
@@ -481,6 +495,10 @@ void rebuildHemisphereObjectStateAttractors(HemisphereRuntime& hemisphere,
                                             const Config& config);
 size_t inferAuxiliaryChannelCount(const RetinaAdapter& retina);
 size_t inferFrequencyBandCount(const RetinaAdapter& retina);
+std::vector<size_t> inferHemisphereBranchPatternSizes(
+    std::vector<std::unique_ptr<RetinaAdapter>>& retinas,
+    const VisualStimulus& image,
+    bool useFeatures);
 std::vector<double> applyContextualGrouping(const RetinaAdapter& retina,
                                             std::vector<double> part);
 ContextualGroupingLayout inferContextualGroupingLayout(const RetinaAdapter& retina,
@@ -491,7 +509,46 @@ std::vector<double> extractRetinaPartRawPattern(RetinaAdapter& retina,
                                                 const VisualStimulus& image,
                                                 bool useFeatures,
                                                 bool learnPatterns);
+std::vector<double> extractPattern(std::vector<std::unique_ptr<RetinaAdapter>>& retinas,
+                                   const VisualStimulus& image,
+                                   const Config& config,
+                                   bool trainingPhase,
+                                   bool learnPatterns,
+                                   size_t sampleSeed,
+                                   FlowAuditSampleCapture* flowAuditCapture);
+std::vector<HemisphereDecisionTrace> inferHemisphereDecisions(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualStimulus& image,
+    const Config& config,
+    std::vector<FlowAuditSampleCapture>* flowAuditCaptures = nullptr);
+std::unique_ptr<ClassificationStrategy> makeClassifierStrategy(const std::string& type,
+                                                               int k,
+                                                               double exponent,
+                                                               const Config& config);
 std::string toLower(std::string value);
+std::vector<Stage1TapInput> buildJepaStage1TapInputs(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& trainLoader,
+    const Config& config);
+std::vector<Stage1TapInput> buildJepaStage1EvalTapInputs(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& loader,
+    const std::vector<size_t>& indices,
+    const Config& config);
+void maybeExportJepaStage1Taps(std::vector<HemisphereRuntime>& hemispheres,
+                               const VisualDomainAdapter& trainLoader,
+                               const Config& config);
+bool maybeTrainJepaModel(std::vector<HemisphereRuntime>& hemispheres,
+                         const VisualDomainAdapter& trainLoader,
+                         const Config& config,
+                         snnfw::jepa::JepaTrainingArtifacts* artifactsOut = nullptr);
+JepaProbeResult evaluateJepaProbe(std::vector<HemisphereRuntime>& hemispheres,
+                                  const VisualDomainAdapter& trainLoader,
+                                  const VisualDomainAdapter& testLoader,
+                                  const std::vector<size_t>& indices,
+                                  const Config& config,
+                                  const snnfw::jepa::JepaModel& model,
+                                  const std::string& label);
 
 size_t hemisphereWorkerCount(size_t hemisphereCount) {
     const size_t hardwareThreads =
@@ -1458,6 +1515,316 @@ std::string toLower(std::string value) {
     return value;
 }
 
+std::vector<Stage1TapInput> buildJepaStage1TapInputs(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& trainLoader,
+    const Config& config) {
+    std::vector<Stage1TapInput> taps;
+    if (!config.jepa.enabled) {
+        return taps;
+    }
+
+    const bool useRawStage1 =
+        config.jepa.tapSurface == snnfw::jepa::TapSurface::RawStage1;
+    const std::string surfaceName = useRawStage1 ? "raw_stage1" : "promoted_stage1";
+    const bool temporalFixationMode =
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalFixation &&
+        config.saccadeFixations > 1;
+
+    for (auto& hemisphere : hemispheres) {
+        if (temporalFixationMode && !hemisphere.trainingSourceIndices.empty()) {
+            std::vector<size_t> uniqueSourceIndices;
+            uniqueSourceIndices.reserve(hemisphere.trainingSourceIndices.size());
+            std::unordered_set<size_t> seenSources;
+            for (size_t sourceIndex : hemisphere.trainingSourceIndices) {
+                if (seenSources.insert(sourceIndex).second) {
+                    uniqueSourceIndices.push_back(sourceIndex);
+                }
+            }
+            size_t available = uniqueSourceIndices.size();
+            if (config.jepa.maxSamples > 0) {
+                available = std::min(
+                    available, static_cast<size_t>(std::max(0, config.jepa.maxSamples)));
+            }
+            for (size_t i = 0; i < available; ++i) {
+                const size_t sourceIndex = uniqueSourceIndices[i];
+                const auto& image = trainLoader.getStimulus(sourceIndex);
+                if (hemisphere.retinaPatternSizes.empty()) {
+                    hemisphere.retinaPatternSizes = inferHemisphereBranchPatternSizes(
+                        hemisphere.retinas, image, config.useFeatures);
+                }
+                const auto fixationImages =
+                    buildExtractionStimuli(image, config, true, sourceIndex, &hemisphere.retinas);
+                for (size_t fixationIndex = 0; fixationIndex < fixationImages.size(); ++fixationIndex) {
+                    Stage1TapInput tap;
+                    tap.hemisphereName = hemisphere.name;
+                    tap.surfaceName = surfaceName;
+                    tap.label = image.label;
+                    tap.sourceIndex = sourceIndex;
+                    tap.sourceViewIndex = fixationIndex;
+                    tap.pattern = extractPattern(
+                        hemisphere.retinas,
+                        fixationImages[fixationIndex],
+                        config,
+                        false,
+                        false,
+                        0U,
+                        nullptr);
+                    tap.branchSizes = hemisphere.retinaPatternSizes;
+                    const size_t branchTotal = std::accumulate(
+                        tap.branchSizes.begin(), tap.branchSizes.end(), static_cast<size_t>(0));
+                    if (branchTotal != tap.pattern.size()) {
+                        tap.branchSizes.clear();
+                    }
+                    taps.push_back(std::move(tap));
+                }
+            }
+            continue;
+        }
+
+        std::unordered_map<size_t, size_t> sourceViewCounts;
+        const auto& patterns =
+            useRawStage1 ? hemisphere.rawTrainingPatterns : hemisphere.trainingPatterns;
+        if (patterns.empty()) {
+            continue;
+        }
+
+        if (hemisphere.retinaPatternSizes.empty() && !hemisphere.trainingSourceIndices.empty()) {
+            const auto& referenceImage =
+                trainLoader.getStimulus(hemisphere.trainingSourceIndices.front());
+            hemisphere.retinaPatternSizes = inferHemisphereBranchPatternSizes(
+                hemisphere.retinas, referenceImage, config.useFeatures);
+        }
+
+        size_t available = patterns.size();
+        if (!hemisphere.trainingSourceIndices.empty()) {
+            available = std::min(available, hemisphere.trainingSourceIndices.size());
+        }
+        if (config.jepa.maxSamples > 0) {
+            available = std::min(
+                available, static_cast<size_t>(std::max(0, config.jepa.maxSamples)));
+        }
+
+        for (size_t i = 0; i < available; ++i) {
+            Stage1TapInput tap;
+            tap.hemisphereName = hemisphere.name;
+            tap.surfaceName = surfaceName;
+            tap.label = patterns[i].label;
+            tap.sourceIndex =
+                hemisphere.trainingSourceIndices.empty() ? i : hemisphere.trainingSourceIndices[i];
+            tap.sourceViewIndex = sourceViewCounts[tap.sourceIndex]++;
+            tap.pattern = patterns[i].pattern;
+            tap.branchSizes = hemisphere.retinaPatternSizes;
+            const size_t branchTotal = std::accumulate(
+                tap.branchSizes.begin(), tap.branchSizes.end(), static_cast<size_t>(0));
+            if (branchTotal != tap.pattern.size()) {
+                tap.branchSizes.clear();
+            }
+            taps.push_back(std::move(tap));
+        }
+    }
+
+    return taps;
+}
+
+std::vector<Stage1TapInput> buildJepaStage1EvalTapInputs(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& loader,
+    const std::vector<size_t>& indices,
+    const Config& config) {
+    std::vector<Stage1TapInput> taps;
+    if (!config.jepa.enabled) {
+        return taps;
+    }
+
+    const bool useRawStage1 =
+        config.jepa.tapSurface == snnfw::jepa::TapSurface::RawStage1;
+    const std::string surfaceName = useRawStage1 ? "raw_stage1" : "promoted_stage1";
+    taps.reserve(indices.size() * hemispheres.size());
+
+    for (size_t sourceIndex : indices) {
+        const auto& image = loader.getStimulus(sourceIndex);
+        const int label = image.label;
+        if (label < 0 || label >= config.numClasses) {
+            continue;
+        }
+
+        if (useRawStage1) {
+            for (auto& hemisphere : hemispheres) {
+                if (hemisphere.retinaPatternSizes.empty()) {
+                    hemisphere.retinaPatternSizes = inferHemisphereBranchPatternSizes(
+                        hemisphere.retinas, image, config.useFeatures);
+                }
+
+                Stage1TapInput tap;
+                tap.hemisphereName = hemisphere.name;
+                tap.surfaceName = surfaceName;
+                tap.label = label;
+                tap.sourceIndex = sourceIndex;
+                tap.sourceViewIndex = 0;
+                tap.pattern = extractPattern(
+                    hemisphere.retinas, image, config, false, false, 0U, nullptr);
+                tap.branchSizes = hemisphere.retinaPatternSizes;
+                const size_t branchTotal = std::accumulate(
+                    tap.branchSizes.begin(), tap.branchSizes.end(), static_cast<size_t>(0));
+                if (branchTotal != tap.pattern.size()) {
+                    tap.branchSizes.clear();
+                }
+                taps.push_back(std::move(tap));
+            }
+            continue;
+        }
+
+        const auto traces = inferHemisphereDecisions(hemispheres, image, config);
+        for (size_t hemisphereIndex = 0; hemisphereIndex < hemispheres.size(); ++hemisphereIndex) {
+            Stage1TapInput tap;
+            tap.hemisphereName = hemispheres[hemisphereIndex].name;
+            tap.surfaceName = surfaceName;
+            tap.label = label;
+            tap.sourceIndex = sourceIndex;
+            tap.sourceViewIndex = 0;
+            if (hemisphereIndex < traces.size()) {
+                tap.pattern = traces[hemisphereIndex].classifierPattern.empty()
+                    ? traces[hemisphereIndex].pattern
+                    : traces[hemisphereIndex].classifierPattern;
+            }
+            taps.push_back(std::move(tap));
+        }
+    }
+
+    return taps;
+}
+
+void maybeExportJepaStage1Taps(std::vector<HemisphereRuntime>& hemispheres,
+                               const VisualDomainAdapter& trainLoader,
+                               const Config& config) {
+    if (!config.jepa.enabled) {
+        return;
+    }
+
+    auto taps = buildJepaStage1TapInputs(hemispheres, trainLoader, config);
+    if (taps.empty()) {
+        std::cout << "  JEPA tap export skipped: no stage-1 patterns available" << std::endl;
+        return;
+    }
+
+    const std::string outputPath = config.jepa.dumpPath.empty()
+        ? "build/jepa_stage1_latents.json"
+        : config.jepa.dumpPath;
+    const auto summary =
+        snnfw::jepa::writeStage1LatentSamples(taps, config.jepa, outputPath);
+    std::cout << "  JEPA stage1 taps exported: samples=" << summary.sampleCount
+              << ", hemisphere_views=" << summary.hemisphereViewCount
+              << ", masked_views=" << summary.maskedViewCount
+              << ", temporal_pairs=" << summary.temporalPairCount
+              << ", branch_tokens=" << summary.branchTokenCount
+              << ", hemisphere_tokens=" << summary.hemisphereTokenCount
+              << ", leakage_violations=" << summary.leakageViolationCount
+              << ", path=" << outputPath << std::endl;
+}
+
+bool maybeTrainJepaModel(std::vector<HemisphereRuntime>& hemispheres,
+                         const VisualDomainAdapter& trainLoader,
+                         const Config& config,
+                         snnfw::jepa::JepaTrainingArtifacts* artifactsOut) {
+    if (!config.jepa.enabled || !config.jepa.trainerEnabled) {
+        return false;
+    }
+
+    auto taps = buildJepaStage1TapInputs(hemispheres, trainLoader, config);
+    if (taps.empty()) {
+        std::cout << "  JEPA trainer skipped: no stage-1 patterns available" << std::endl;
+        return false;
+    }
+
+    const auto samples = snnfw::jepa::buildStage1LatentSamples(taps, config.jepa);
+    const std::string outputPath = config.jepa.trainerDumpPath.empty()
+        ? "build/jepa_minimal_trainer.json"
+        : config.jepa.trainerDumpPath;
+    auto artifacts = snnfw::jepa::trainMinimalModel(samples, config.jepa, outputPath);
+    const auto& summary = artifacts.summary;
+    std::cout << "  JEPA trainer summary: examples=" << summary.trainingExampleCount
+              << ", target_mode=" << snnfw::jepa::targetModeName(config.jepa.targetMode)
+              << ", temporal_examples=" << summary.temporalExampleCount
+              << ", fallback_masked_examples=" << summary.fallbackMaskedExampleCount
+              << ", epochs=" << summary.epochCount
+              << ", projection_dim=" << summary.projectionDim
+              << ", loss=" << std::fixed << std::setprecision(4) << summary.meanLoss
+              << ", shuffled_loss=" << summary.meanShuffledLoss
+              << ", pred_var=" << summary.predictionVariance
+              << ", target_var=" << summary.targetVariance
+              << ", variance_penalty=" << summary.meanVariancePenalty
+              << ", path=" << outputPath << std::endl;
+    if (artifactsOut != nullptr) {
+        *artifactsOut = std::move(artifacts);
+    }
+    return true;
+}
+
+JepaProbeResult evaluateJepaProbe(std::vector<HemisphereRuntime>& hemispheres,
+                                  const VisualDomainAdapter& trainLoader,
+                                  const VisualDomainAdapter& testLoader,
+                                  const std::vector<size_t>& indices,
+                                  const Config& config,
+                                  const snnfw::jepa::JepaModel& model,
+                                  const std::string& label) {
+    JepaProbeResult result;
+    result.confusion.assign(
+        static_cast<size_t>(config.numClasses),
+        std::vector<int>(static_cast<size_t>(config.numClasses), 0));
+    const auto start = std::chrono::high_resolution_clock::now();
+
+    const auto trainTaps = buildJepaStage1TapInputs(hemispheres, trainLoader, config);
+    const auto trainSamples = snnfw::jepa::buildStage1LatentSamples(trainTaps, config.jepa);
+    std::vector<ClassificationStrategy::LabeledPattern> trainingPatterns;
+    trainingPatterns.reserve(trainSamples.size());
+    for (const auto& sample : trainSamples) {
+        auto embedding = snnfw::jepa::encodeSample(sample, model);
+        if (embedding.empty()) {
+            continue;
+        }
+        trainingPatterns.emplace_back(embedding, sample.label);
+    }
+    if (trainingPatterns.empty()) {
+        throw std::runtime_error("JEPA probe found no valid training embeddings");
+    }
+
+    auto classifier = makeClassifierStrategy(
+        config.classifier, config.knnK, config.classifierExponent, config);
+    const auto evalTaps = buildJepaStage1EvalTapInputs(hemispheres, testLoader, indices, config);
+    const auto evalSamples = snnfw::jepa::buildStage1LatentSamples(evalTaps, config.jepa);
+    const int maxTests = static_cast<int>(evalSamples.size());
+    const int progressStep = maxTests >= 1000 ? 200 : (maxTests >= 200 ? 50 : 25);
+
+    for (const auto& sample : evalSamples) {
+        if (sample.label < 0 || sample.label >= config.numClasses) {
+            continue;
+        }
+        auto embedding = snnfw::jepa::encodeSample(sample, model);
+        if (embedding.empty()) {
+            continue;
+        }
+
+        const int predicted =
+            classifier->classify(embedding, trainingPatterns, cosineSimilarity);
+        result.confusion[static_cast<size_t>(sample.label)][static_cast<size_t>(predicted)]++;
+        result.correct += (predicted == sample.label) ? 1 : 0;
+        result.tested++;
+
+        if (result.tested % progressStep == 0) {
+            const double acc =
+                100.0 * static_cast<double>(result.correct) /
+                static_cast<double>(std::max(1, result.tested));
+            std::cout << "  " << label << ": " << result.tested << "/" << maxTests
+                      << " (" << std::fixed << std::setprecision(2) << acc << "%)" << std::endl;
+        }
+    }
+
+    const auto end = std::chrono::high_resolution_clock::now();
+    result.seconds = std::chrono::duration<double>(end - start).count();
+    return result;
+}
+
 std::string trim(std::string value) {
     const auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
     value.erase(value.begin(),
@@ -2166,6 +2533,127 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
         irConfig.stringParams.find("flow_audit_output_prefix");
     if (flowAuditOutputPrefixIt != irConfig.stringParams.end()) {
         config.flowAuditOutputPrefix = trim(flowAuditOutputPrefixIt->second);
+    }
+    const auto jepaDumpPathIt = irConfig.stringParams.find("jepa_dump_path");
+    if (jepaDumpPathIt != irConfig.stringParams.end()) {
+        config.jepa.dumpPath = trim(jepaDumpPathIt->second);
+    }
+    const auto jepaTapSurfaceIt = irConfig.stringParams.find("jepa_tap_surface");
+    if (jepaTapSurfaceIt != irConfig.stringParams.end()) {
+        const std::string value = toLower(trim(jepaTapSurfaceIt->second));
+        if (value == "raw_stage1") {
+            config.jepa.tapSurface = snnfw::jepa::TapSurface::RawStage1;
+        } else if (value == "promoted_stage1") {
+            config.jepa.tapSurface = snnfw::jepa::TapSurface::PromotedStage1;
+        } else {
+            throw std::runtime_error("Unsupported jepa_tap_surface: " + value);
+        }
+    }
+    const auto jepaEnabledIt = irConfig.intParams.find("jepa_enabled");
+    if (jepaEnabledIt != irConfig.intParams.end()) {
+        config.jepa.enabled = jepaEnabledIt->second != 0;
+    }
+    const auto jepaTrainerEnabledIt = irConfig.intParams.find("jepa_trainer_enabled");
+    if (jepaTrainerEnabledIt != irConfig.intParams.end()) {
+        config.jepa.trainerEnabled = jepaTrainerEnabledIt->second != 0;
+    }
+    const auto jepaProbeEnabledIt = irConfig.intParams.find("jepa_probe_enabled");
+    if (jepaProbeEnabledIt != irConfig.intParams.end()) {
+        config.jepa.probeEnabled = jepaProbeEnabledIt->second != 0;
+    }
+    const auto jepaTrainerEpochsIt = irConfig.intParams.find("jepa_trainer_epochs");
+    if (jepaTrainerEpochsIt != irConfig.intParams.end()) {
+        config.jepa.trainerEpochs = std::max(0, jepaTrainerEpochsIt->second);
+    }
+    const auto jepaProjectionDimIt = irConfig.intParams.find("jepa_projection_dim");
+    if (jepaProjectionDimIt != irConfig.intParams.end()) {
+        config.jepa.projectionDim = std::max(1, jepaProjectionDimIt->second);
+    }
+    const auto jepaVisibleBranchCountIt =
+        irConfig.intParams.find("jepa_visible_branch_count");
+    if (jepaVisibleBranchCountIt != irConfig.intParams.end()) {
+        config.jepa.visibleBranchCount = std::max(0, jepaVisibleBranchCountIt->second);
+    }
+    const auto jepaHiddenBranchCountIt =
+        irConfig.intParams.find("jepa_hidden_branch_count");
+    if (jepaHiddenBranchCountIt != irConfig.intParams.end()) {
+        config.jepa.hiddenBranchCount = std::max(0, jepaHiddenBranchCountIt->second);
+    }
+    const auto jepaMaxSamplesIt = irConfig.intParams.find("jepa_max_samples");
+    if (jepaMaxSamplesIt != irConfig.intParams.end()) {
+        config.jepa.maxSamples = std::max(0, jepaMaxSamplesIt->second);
+    }
+    const auto jepaMaskSeedIt = irConfig.intParams.find("jepa_mask_seed");
+    if (jepaMaskSeedIt != irConfig.intParams.end()) {
+        config.jepa.maskSeed = static_cast<unsigned int>(std::max(0, jepaMaskSeedIt->second));
+    }
+    const auto jepaIncludeBranchTokensIt =
+        irConfig.intParams.find("jepa_include_branch_tokens");
+    if (jepaIncludeBranchTokensIt != irConfig.intParams.end()) {
+        config.jepa.includeBranchTokens = jepaIncludeBranchTokensIt->second != 0;
+    }
+    const auto jepaIncludeHemisphereTokenIt =
+        irConfig.intParams.find("jepa_include_hemisphere_token");
+    if (jepaIncludeHemisphereTokenIt != irConfig.intParams.end()) {
+        config.jepa.includeHemisphereToken = jepaIncludeHemisphereTokenIt->second != 0;
+    }
+    const auto jepaEnforceNoLeakageIt =
+        irConfig.intParams.find("jepa_enforce_no_leakage");
+    if (jepaEnforceNoLeakageIt != irConfig.intParams.end()) {
+        config.jepa.enforceNoLeakage = jepaEnforceNoLeakageIt->second != 0;
+    }
+    const auto jepaMaskModeIt = irConfig.stringParams.find("jepa_mask_mode");
+    if (jepaMaskModeIt != irConfig.stringParams.end()) {
+        const std::string value = toLower(trim(jepaMaskModeIt->second));
+        if (value == "none") {
+            config.jepa.maskMode = snnfw::jepa::MaskMode::None;
+        } else if (value == "branch") {
+            config.jepa.maskMode = snnfw::jepa::MaskMode::Branch;
+        } else {
+            throw std::runtime_error("Unsupported jepa_mask_mode: " + value);
+        }
+    }
+    const auto jepaTargetModeIt = irConfig.stringParams.find("jepa_target_mode");
+    if (jepaTargetModeIt != irConfig.stringParams.end()) {
+        const std::string value = toLower(trim(jepaTargetModeIt->second));
+        if (value == "branch_mask") {
+            config.jepa.targetMode = snnfw::jepa::TargetMode::BranchMask;
+        } else if (value == "temporal_fixation") {
+            config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalFixation;
+        } else {
+            throw std::runtime_error("Unsupported jepa_target_mode: " + value);
+        }
+    }
+    const auto jepaTrainerDumpPathIt =
+        irConfig.stringParams.find("jepa_trainer_dump_path");
+    if (jepaTrainerDumpPathIt != irConfig.stringParams.end()) {
+        config.jepa.trainerDumpPath = trim(jepaTrainerDumpPathIt->second);
+    }
+    const auto jepaTrainerLearningRateIt =
+        irConfig.doubleParams.find("jepa_trainer_learning_rate");
+    if (jepaTrainerLearningRateIt != irConfig.doubleParams.end()) {
+        config.jepa.trainerLearningRate = std::max(0.0, jepaTrainerLearningRateIt->second);
+    }
+    const auto jepaTrainerWeightDecayIt =
+        irConfig.doubleParams.find("jepa_trainer_weight_decay");
+    if (jepaTrainerWeightDecayIt != irConfig.doubleParams.end()) {
+        config.jepa.trainerWeightDecay = std::max(0.0, jepaTrainerWeightDecayIt->second);
+    }
+    const auto jepaTargetEmaDecayIt =
+        irConfig.doubleParams.find("jepa_target_ema_decay");
+    if (jepaTargetEmaDecayIt != irConfig.doubleParams.end()) {
+        config.jepa.targetEmaDecay =
+            std::clamp(jepaTargetEmaDecayIt->second, 0.0, 0.999999);
+    }
+    const auto jepaVarianceFloorIt =
+        irConfig.doubleParams.find("jepa_variance_floor");
+    if (jepaVarianceFloorIt != irConfig.doubleParams.end()) {
+        config.jepa.varianceFloor = std::max(0.0, jepaVarianceFloorIt->second);
+    }
+    const auto jepaVariancePenaltyIt =
+        irConfig.doubleParams.find("jepa_variance_penalty");
+    if (jepaVariancePenaltyIt != irConfig.doubleParams.end()) {
+        config.jepa.variancePenalty = std::max(0.0, jepaVariancePenaltyIt->second);
     }
     const auto focusAdjustmentEnabledIt = irConfig.intParams.find("focus_adjustment_enabled");
     if (focusAdjustmentEnabledIt != irConfig.intParams.end()) {
@@ -3920,7 +4408,7 @@ std::vector<HemisphereDecisionTrace> inferHemisphereDecisions(
     std::vector<HemisphereRuntime>& hemispheres,
     const VisualStimulus& image,
     const Config& config,
-    std::vector<FlowAuditSampleCapture>* flowAuditCaptures = nullptr) {
+    std::vector<FlowAuditSampleCapture>* flowAuditCaptures) {
     if (useRecurrentSensoryState(config)) {
         if (flowAuditCaptures != nullptr) {
             flowAuditCaptures->assign(hemispheres.size(), {});
@@ -11307,6 +11795,44 @@ int main(int argc, char* argv[]) {
             std::cout << "  Config: " << config.configPath << std::endl;
         }
         std::cout << "  Retina adapters: " << retinaConfigs.size() << std::endl;
+        if (config.jepa.enabled) {
+            const std::string outputPath = config.jepa.dumpPath.empty()
+                ? "build/jepa_stage1_latents.json"
+                : config.jepa.dumpPath;
+            const std::string trainerPath = config.jepa.trainerDumpPath.empty()
+                ? "build/jepa_minimal_trainer.json"
+                : config.jepa.trainerDumpPath;
+            std::cout << "  JEPA taps: enabled"
+                      << " (surface=" << snnfw::jepa::tapSurfaceName(config.jepa.tapSurface)
+                      << ", mask_mode=" << snnfw::jepa::maskModeName(config.jepa.maskMode)
+                      << ", target_mode="
+                      << snnfw::jepa::targetModeName(config.jepa.targetMode)
+                      << ", visible_branches=" << config.jepa.visibleBranchCount
+                      << ", hidden_branches=" << config.jepa.hiddenBranchCount
+                      << ", max_samples=" << config.jepa.maxSamples
+                      << ", branch_tokens="
+                      << (config.jepa.includeBranchTokens ? "on" : "off")
+                      << ", hemisphere_token="
+                      << (config.jepa.includeHemisphereToken ? "on" : "off")
+                      << ", enforce_no_leakage="
+                      << (config.jepa.enforceNoLeakage ? "on" : "off")
+                      << ", path=" << outputPath << ")"
+                      << std::endl;
+            std::cout << "  JEPA trainer: "
+                      << (config.jepa.trainerEnabled ? "enabled" : "disabled")
+                      << " (epochs=" << config.jepa.trainerEpochs
+                      << ", projection_dim=" << config.jepa.projectionDim
+                      << ", lr=" << config.jepa.trainerLearningRate
+                      << ", weight_decay=" << config.jepa.trainerWeightDecay
+                      << ", target_ema_decay=" << config.jepa.targetEmaDecay
+                      << ", variance_floor=" << config.jepa.varianceFloor
+                      << ", variance_penalty=" << config.jepa.variancePenalty
+                      << ", path=" << trainerPath << ")"
+                      << std::endl;
+            std::cout << "  JEPA probe: "
+                      << (config.jepa.probeEnabled ? "enabled" : "disabled")
+                      << std::endl;
+        }
         for (const auto& retinaConfig : retinaConfigs) {
             std::cout << "    - " << retinaConfig.name
                       << ": grid="
@@ -11665,6 +12191,10 @@ int main(int argc, char* argv[]) {
             setRetinaHomeostaticLearning(retinas, false);
 
             std::cout << "  Stored training patterns: " << trainingPatterns.size() << std::endl;
+            if (config.jepa.enabled) {
+                std::cout << "  JEPA tap export skipped: unilateral path is not wired yet"
+                          << std::endl;
+            }
             const auto end = std::chrono::high_resolution_clock::now();
             const double trainingSeconds =
                 std::chrono::duration<double>(end - trainingStart).count();
@@ -12027,6 +12557,11 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            maybeExportJepaStage1Taps(hemispheres, *trainLoader, config);
+            snnfw::jepa::JepaTrainingArtifacts jepaArtifacts;
+            const bool hasJepaModel =
+                maybeTrainJepaModel(hemispheres, *trainLoader, config, &jepaArtifacts);
+
             std::unique_ptr<ClassificationStrategy> fusionClassifier;
             FusionRuntime fusionRuntime;
             initializeFusionRuntime(fusionRuntime, config.numClasses);
@@ -12082,6 +12617,22 @@ int main(int argc, char* argv[]) {
                 hemispheres, trainingArtifacts, *trainLoader, split, config, fusionRuntime);
 
             if (!config.focusOnly) {
+                std::optional<JepaProbeResult> jepaProbeEval;
+                if (config.jepa.probeEnabled) {
+                    if (!hasJepaModel) {
+                        throw std::runtime_error(
+                            "JEPA probe requires jepa_enabled=1 and jepa_trainer_enabled=1");
+                    }
+                    jepaProbeEval = evaluateJepaProbe(
+                        hemispheres,
+                        *trainLoader,
+                        *testLoader,
+                        selectedTestIndices,
+                        config,
+                        jepaArtifacts.model,
+                        "JEPA Probe");
+                }
+
                 auto separabilityRuntime = baseSeparabilityRuntime;
                 auto flowAuditRuntime = baseFlowAuditRuntime;
                 resetOrientationFlowDiagnostics(hemispheres);
@@ -12122,6 +12673,26 @@ int main(int argc, char* argv[]) {
 
                 printPerClassAccuracy(eval.confusion, config);
                 printTopConfusions(eval.confusion, config);
+
+                if (jepaProbeEval.has_value()) {
+                    const double probeAccuracy =
+                        100.0 * static_cast<double>(jepaProbeEval->correct) /
+                        static_cast<double>(std::max(1, jepaProbeEval->tested));
+                    std::cout << "\n=== JEPA Probe Results ===" << std::endl;
+                    std::cout << "  Accuracy: " << std::fixed << std::setprecision(2)
+                              << probeAccuracy << "%" << std::endl;
+                    std::cout << "  Correct: " << jepaProbeEval->correct << "/"
+                              << jepaProbeEval->tested << std::endl;
+                    std::cout << "  Delta vs baseline: " << std::showpos
+                              << std::fixed << std::setprecision(2)
+                              << (probeAccuracy - accuracy) << " pts" << std::noshowpos
+                              << std::endl;
+                    std::cout << "  Elapsed: " << std::fixed << std::setprecision(2)
+                              << (trainingSeconds + jepaProbeEval->seconds) << "s"
+                              << std::endl;
+                    printPerClassAccuracy(jepaProbeEval->confusion, config);
+                    printTopConfusions(jepaProbeEval->confusion, config);
+                }
             }
 
             if (!config.focusGroups.empty()) {

@@ -21,12 +21,17 @@ if(NOT CMAKE_BUILD_TYPE)
     message(STATUS "Building release version...")
 endif()
 
+option(SNNJEPA_ENABLE_LTO "Enable link-time optimization in release builds" ON)
+
 # Find OpenMP for parallelization
 find_package(OpenMP REQUIRED)
 
 # Compiler flags
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -Wpedantic -fsanitize=address -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -flto")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+if(SNNJEPA_ENABLE_LTO)
+    string(APPEND CMAKE_CXX_FLAGS_RELEASE " -flto")
+endif()
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${CMAKE_EXE_LINKER_FLAGS_DEBUG} -fsanitize=address")
 
 # Include directories
@@ -165,5 +170,5 @@ else()
 endif()
 
 # Add subdirectories
-add_subdirectory(src)
+add_subdirectory(include/snnfw)
 add_subdirectory(experiments)
