@@ -17,11 +17,13 @@ enum class MaskMode {
 
 enum class TargetMode {
     BranchMask,
-    TemporalFixation
+    TemporalFixation,
+    TemporalHemisphereSummary
 };
 
 struct JepaConfig {
     bool enabled = false;
+    bool exportEnabled = true;
     std::string dumpPath;
     std::string trainerDumpPath;
     TapSurface tapSurface = TapSurface::PromotedStage1;
@@ -43,6 +45,14 @@ struct JepaConfig {
     double targetEmaDecay = 0.99;
     double varianceFloor = 0.02;
     double variancePenalty = 0.25;
+    double mseLossWeight = 1.0;
+    double cosineLossWeight = 1.0;
+    bool encodeViewMetadata = true;
+    double metadataScale = 0.2;
+    std::string probeMode = "knn";
+    int probeHiddenDim = 64;
+    int probeEpochs = 30;
+    double probeLearningRate = 0.05;
 };
 
 inline const char* tapSurfaceName(TapSurface surface) {
@@ -71,6 +81,8 @@ inline const char* targetModeName(TargetMode mode) {
             return "branch_mask";
         case TargetMode::TemporalFixation:
             return "temporal_fixation";
+        case TargetMode::TemporalHemisphereSummary:
+            return "temporal_hemisphere_summary";
     }
     return "temporal_fixation";
 }

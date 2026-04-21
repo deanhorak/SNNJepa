@@ -8,6 +8,7 @@
 #include "snnfw/jepa/JepaConfig.h"
 #include "snnfw/jepa/JepaStateExtractor.h"
 #include "snnfw/jepa/JepaTrainer.h"
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <array>
@@ -227,6 +228,9 @@ struct Config {
     bool flowAuditEnabled = false;
     int flowAuditSampleLimit = 0;
     std::string flowAuditOutputPrefix;
+    bool jepaRepresentationAuditEnabled = false;
+    int jepaRepresentationAuditSampleLimit = 0;
+    std::string jepaRepresentationAuditOutputPath;
     JepaConfig jepa;
 };
 
@@ -235,6 +239,50 @@ struct JepaProbeResult {
     int correct = 0;
     int tested = 0;
     double seconds = 0.0;
+};
+
+struct RepresentationAuditSample {
+    size_t sourceIndex = 0;
+    int label = -1;
+    std::vector<double> embedding;
+};
+
+struct TemporalConsistencySummary {
+    double adjacentMeanCosine = 0.0;
+    double allPairMeanCosine = 0.0;
+    int adjacentPairCount = 0;
+    int allPairCount = 0;
+    int groupedSequenceCount = 0;
+};
+
+struct RepresentationAuditMetrics {
+    std::string name;
+    std::string surface;
+    bool recurrent = false;
+    bool usesJepaEncoder = false;
+    bool available = false;
+    std::string note;
+    size_t trainSampleCount = 0;
+    size_t testSampleCount = 0;
+    size_t embeddingDim = 0;
+    double trainLeaveOneOutAccuracy = 0.0;
+    double testNearestNeighborAccuracy = 0.0;
+    double testCentroidAccuracy = 0.0;
+    double testMeanCentroidMargin = 0.0;
+    TemporalConsistencySummary trainConsistency;
+    TemporalConsistencySummary testConsistency;
+};
+
+struct RepresentationAuditReport {
+    std::vector<RepresentationAuditMetrics> metrics;
+    std::string outputPath;
+};
+
+struct ProbeMlp {
+    std::vector<std::vector<double>> hiddenWeights;
+    std::vector<double> hiddenBias;
+    std::vector<std::vector<double>> outputWeights;
+    std::vector<double> outputBias;
 };
 
 struct ObjectStateAttractor {
@@ -678,6 +726,158 @@ double cosineSimilarity(const std::vector<double>& a, const std::vector<double>&
     return dot / (std::sqrt(normA) * std::sqrt(normB));
 }
 
+ProbeMlp makeProbeMlp(size_t inputDim, int hiddenDim, int numClasses, unsigned int seed) {
+    ProbeMlp mlp;
+    const size_t hidden = static_cast<size_t>(std::max(1, hiddenDim));
+    const size_t classes = static_cast<size_t>(std::max(1, numClasses));
+    mlp.hiddenWeights.assign(hidden, std::vector<double>(inputDim, 0.0));
+    mlp.hiddenBias.assign(hidden, 0.0);
+    mlp.outputWeights.assign(classes, std::vector<double>(hidden, 0.0));
+    mlp.outputBias.assign(classes, 0.0);
+
+    std::mt19937 rng(seed);
+    const double hiddenScale = inputDim > 0 ? std::sqrt(2.0 / static_cast<double>(inputDim)) : 0.1;
+    const double outputScale = std::sqrt(2.0 / static_cast<double>(hidden));
+    std::normal_distribution<double> hiddenDist(0.0, hiddenScale);
+    std::normal_distribution<double> outputDist(0.0, outputScale);
+    for (auto& row : mlp.hiddenWeights) {
+        for (double& value : row) {
+            value = hiddenDist(rng);
+        }
+    }
+    for (auto& row : mlp.outputWeights) {
+        for (double& value : row) {
+            value = outputDist(rng);
+        }
+    }
+    return mlp;
+}
+
+std::vector<double> applyProbeHidden(const ProbeMlp& mlp, const std::vector<double>& input) {
+    std::vector<double> hidden(mlp.hiddenBias.size(), 0.0);
+    for (size_t row = 0; row < mlp.hiddenWeights.size(); ++row) {
+        double value = mlp.hiddenBias[row];
+        for (size_t col = 0; col < std::min(input.size(), mlp.hiddenWeights[row].size()); ++col) {
+            value += mlp.hiddenWeights[row][col] * input[col];
+        }
+        hidden[row] = std::tanh(value);
+    }
+    return hidden;
+}
+
+std::vector<double> applyProbeOutput(const ProbeMlp& mlp, const std::vector<double>& hidden) {
+    std::vector<double> logits(mlp.outputBias.size(), 0.0);
+    for (size_t row = 0; row < mlp.outputWeights.size(); ++row) {
+        double value = mlp.outputBias[row];
+        for (size_t col = 0; col < std::min(hidden.size(), mlp.outputWeights[row].size()); ++col) {
+            value += mlp.outputWeights[row][col] * hidden[col];
+        }
+        logits[row] = value;
+    }
+    return logits;
+}
+
+std::vector<double> softmax(std::vector<double> logits) {
+    if (logits.empty()) {
+        return logits;
+    }
+    const double maxLogit = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (double& value : logits) {
+        value = std::exp(value - maxLogit);
+        sum += value;
+    }
+    if (sum <= 0.0) {
+        return std::vector<double>(logits.size(), 1.0 / static_cast<double>(logits.size()));
+    }
+    for (double& value : logits) {
+        value /= sum;
+    }
+    return logits;
+}
+
+int argmaxIndex(const std::vector<double>& values) {
+    if (values.empty()) {
+        return 0;
+    }
+    return static_cast<int>(std::distance(values.begin(),
+        std::max_element(values.begin(), values.end())));
+}
+
+ProbeMlp trainProbeMlp(const std::vector<ClassificationStrategy::LabeledPattern>& trainingPatterns,
+                       int numClasses,
+                       int hiddenDim,
+                       int epochs,
+                       double learningRate,
+                       unsigned int seed) {
+    if (trainingPatterns.empty()) {
+        throw std::runtime_error("Cannot train JEPA MLP probe with no training patterns");
+    }
+    const size_t inputDim = trainingPatterns.front().pattern.size();
+    ProbeMlp mlp = makeProbeMlp(inputDim, hiddenDim, numClasses, seed);
+    const size_t hidden = mlp.hiddenBias.size();
+    const size_t classes = mlp.outputBias.size();
+    const double batchScale = 1.0 / static_cast<double>(trainingPatterns.size());
+
+    for (int epoch = 0; epoch < std::max(1, epochs); ++epoch) {
+        std::vector<std::vector<double>> hiddenWeightGrads(hidden, std::vector<double>(inputDim, 0.0));
+        std::vector<double> hiddenBiasGrads(hidden, 0.0);
+        std::vector<std::vector<double>> outputWeightGrads(classes, std::vector<double>(hidden, 0.0));
+        std::vector<double> outputBiasGrads(classes, 0.0);
+
+        for (const auto& pattern : trainingPatterns) {
+            const auto hiddenState = applyProbeHidden(mlp, pattern.pattern);
+            const auto probabilities = softmax(applyProbeOutput(mlp, hiddenState));
+            std::vector<double> outputGrad = probabilities;
+            if (pattern.label >= 0 && pattern.label < static_cast<int>(classes)) {
+                outputGrad[static_cast<size_t>(pattern.label)] -= 1.0;
+            }
+
+            for (size_t row = 0; row < classes; ++row) {
+                outputBiasGrads[row] += outputGrad[row];
+                for (size_t col = 0; col < hidden; ++col) {
+                    outputWeightGrads[row][col] += outputGrad[row] * hiddenState[col];
+                }
+            }
+
+            std::vector<double> hiddenGrad(hidden, 0.0);
+            for (size_t col = 0; col < hidden; ++col) {
+                double grad = 0.0;
+                for (size_t row = 0; row < classes; ++row) {
+                    grad += mlp.outputWeights[row][col] * outputGrad[row];
+                }
+                hiddenGrad[col] = grad * (1.0 - (hiddenState[col] * hiddenState[col]));
+            }
+
+            for (size_t row = 0; row < hidden; ++row) {
+                hiddenBiasGrads[row] += hiddenGrad[row];
+                for (size_t col = 0; col < inputDim; ++col) {
+                    hiddenWeightGrads[row][col] += hiddenGrad[row] * pattern.pattern[col];
+                }
+            }
+        }
+
+        for (size_t row = 0; row < hidden; ++row) {
+            mlp.hiddenBias[row] -= learningRate * hiddenBiasGrads[row] * batchScale;
+            for (size_t col = 0; col < inputDim; ++col) {
+                mlp.hiddenWeights[row][col] -= learningRate * hiddenWeightGrads[row][col] * batchScale;
+            }
+        }
+        for (size_t row = 0; row < classes; ++row) {
+            mlp.outputBias[row] -= learningRate * outputBiasGrads[row] * batchScale;
+            for (size_t col = 0; col < hidden; ++col) {
+                mlp.outputWeights[row][col] -= learningRate * outputWeightGrads[row][col] * batchScale;
+            }
+        }
+    }
+
+    return mlp;
+}
+
+int classifyWithProbeMlp(const ProbeMlp& mlp, const std::vector<double>& embedding) {
+    return argmaxIndex(softmax(applyProbeOutput(mlp, applyProbeHidden(mlp, embedding))));
+}
+
 std::string normalizeLabelToken(std::string token) {
     token.erase(std::remove_if(token.begin(), token.end(), ::isspace), token.end());
     std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) {
@@ -940,6 +1140,548 @@ std::string defaultFlowAuditOutputPrefix(const Config& config) {
     }
     stem = sanitizeFlowAuditStem(stem);
     return (baseDir / stem).string();
+}
+
+std::string defaultJepaRepresentationAuditOutputPath(const Config& config) {
+    if (!config.jepaRepresentationAuditOutputPath.empty()) {
+        return config.jepaRepresentationAuditOutputPath;
+    }
+
+    std::filesystem::path baseDir("build");
+    std::string stem = "jepa_representation_audit";
+    if (!config.configPath.empty()) {
+        stem = std::filesystem::path(config.configPath).stem().string() +
+               "_jepa_representation_audit";
+    } else if (!config.inputDomain.empty()) {
+        stem = config.inputDomain + "_" + config.inputVariant + "_jepa_representation_audit";
+    }
+    stem = sanitizeFlowAuditStem(stem);
+    return (baseDir / (stem + ".json")).string();
+}
+
+std::vector<double> flattenJepaView(const snnfw::jepa::JepaHemisphereView& view) {
+    if (!view.hemisphereToken.empty()) {
+        return view.hemisphereToken;
+    }
+
+    std::vector<double> values;
+    for (const auto& token : view.branchTokens) {
+        values.insert(values.end(), token.values.begin(), token.values.end());
+    }
+    return values;
+}
+
+std::vector<double> meanPoolDenseVectors(const std::vector<std::vector<double>>& values) {
+    if (values.empty() || values.front().empty()) {
+        return {};
+    }
+
+    const size_t dim = values.front().size();
+    std::vector<double> pooled(dim, 0.0);
+    int validCount = 0;
+    for (const auto& value : values) {
+        if (value.size() != dim) {
+            continue;
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            pooled[i] += value[i];
+        }
+        ++validCount;
+    }
+    if (validCount <= 0) {
+        return {};
+    }
+    const double scale = 1.0 / static_cast<double>(validCount);
+    for (double& entry : pooled) {
+        entry *= scale;
+    }
+    return pooled;
+}
+
+std::vector<RepresentationAuditSample> buildDirectRepresentationSamples(
+    const std::vector<snnfw::jepa::JepaLatentSample>& samples) {
+    std::vector<RepresentationAuditSample> embeddings;
+    embeddings.reserve(samples.size());
+
+    for (const auto& sample : samples) {
+        std::vector<const snnfw::jepa::JepaHemisphereView*> views;
+        views.reserve(sample.hemisphereViews.size());
+        for (const auto& view : sample.hemisphereViews) {
+            views.push_back(&view);
+        }
+        std::sort(views.begin(), views.end(),
+                  [](const snnfw::jepa::JepaHemisphereView* lhs,
+                     const snnfw::jepa::JepaHemisphereView* rhs) {
+                      if (lhs->hemisphereName != rhs->hemisphereName) {
+                          return lhs->hemisphereName < rhs->hemisphereName;
+                      }
+                      if (lhs->surfaceName != rhs->surfaceName) {
+                          return lhs->surfaceName < rhs->surfaceName;
+                      }
+                      return lhs->sourceViewIndex < rhs->sourceViewIndex;
+                  });
+
+        std::vector<std::vector<double>> perView;
+        perView.reserve(views.size());
+        for (const auto* view : views) {
+            auto values = flattenJepaView(*view);
+            if (!values.empty()) {
+                perView.push_back(std::move(values));
+            }
+        }
+
+        auto pooled = meanPoolDenseVectors(perView);
+        if (pooled.empty()) {
+            continue;
+        }
+
+        RepresentationAuditSample embedding;
+        embedding.sourceIndex = sample.sourceIndex;
+        embedding.label = sample.label;
+        embedding.embedding = std::move(pooled);
+        embeddings.push_back(std::move(embedding));
+    }
+
+    return embeddings;
+}
+
+std::vector<RepresentationAuditSample> buildJepaRepresentationSamples(
+    const std::vector<snnfw::jepa::JepaLatentSample>& samples,
+    const snnfw::jepa::JepaModel& model) {
+    std::vector<RepresentationAuditSample> embeddings;
+    embeddings.reserve(samples.size());
+    for (const auto& sample : samples) {
+        auto embeddingVector = snnfw::jepa::encodeSample(sample, model);
+        if (embeddingVector.empty()) {
+            continue;
+        }
+
+        RepresentationAuditSample embedding;
+        embedding.sourceIndex = sample.sourceIndex;
+        embedding.label = sample.label;
+        embedding.embedding = std::move(embeddingVector);
+        embeddings.push_back(std::move(embedding));
+    }
+    return embeddings;
+}
+
+TemporalConsistencySummary computeTemporalConsistency(
+    const std::vector<snnfw::jepa::JepaLatentSample>& samples) {
+    TemporalConsistencySummary summary;
+    double adjacentSum = 0.0;
+    double allPairSum = 0.0;
+
+    for (const auto& sample : samples) {
+        std::unordered_map<std::string, std::vector<const snnfw::jepa::JepaHemisphereView*>> groups;
+        for (const auto& view : sample.hemisphereViews) {
+            groups[view.hemisphereName + "|" + view.surfaceName].push_back(&view);
+        }
+
+        for (auto& entry : groups) {
+            auto& views = entry.second;
+            std::sort(views.begin(), views.end(),
+                      [](const snnfw::jepa::JepaHemisphereView* lhs,
+                         const snnfw::jepa::JepaHemisphereView* rhs) {
+                          return lhs->sourceViewIndex < rhs->sourceViewIndex;
+                      });
+            std::vector<std::vector<double>> perView;
+            perView.reserve(views.size());
+            for (const auto* view : views) {
+                auto values = flattenJepaView(*view);
+                if (!values.empty()) {
+                    perView.push_back(std::move(values));
+                }
+            }
+            if (perView.size() < 2) {
+                continue;
+            }
+
+            ++summary.groupedSequenceCount;
+            for (size_t i = 0; i + 1 < perView.size(); ++i) {
+                if (perView[i].size() != perView[i + 1].size()) {
+                    continue;
+                }
+                adjacentSum += cosineSimilarity(perView[i], perView[i + 1]);
+                ++summary.adjacentPairCount;
+            }
+            for (size_t i = 0; i < perView.size(); ++i) {
+                for (size_t j = i + 1; j < perView.size(); ++j) {
+                    if (perView[i].size() != perView[j].size()) {
+                        continue;
+                    }
+                    allPairSum += cosineSimilarity(perView[i], perView[j]);
+                    ++summary.allPairCount;
+                }
+            }
+        }
+    }
+
+    if (summary.adjacentPairCount > 0) {
+        summary.adjacentMeanCosine =
+            adjacentSum / static_cast<double>(summary.adjacentPairCount);
+    }
+    if (summary.allPairCount > 0) {
+        summary.allPairMeanCosine =
+            allPairSum / static_cast<double>(summary.allPairCount);
+    }
+    return summary;
+}
+
+void truncateRepresentationAuditSamples(std::vector<RepresentationAuditSample>* samples, int limit) {
+    if (samples == nullptr || limit <= 0 || samples->size() <= static_cast<size_t>(limit)) {
+        return;
+    }
+    samples->resize(static_cast<size_t>(limit));
+}
+
+int classifyNearestNeighbor(const std::vector<double>& query,
+                           const std::vector<RepresentationAuditSample>& references,
+                           size_t excludeIndex = std::numeric_limits<size_t>::max()) {
+    int bestLabel = -1;
+    double bestScore = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < references.size(); ++i) {
+        if (i == excludeIndex) {
+            continue;
+        }
+        if (query.size() != references[i].embedding.size()) {
+            continue;
+        }
+        const double score = cosineSimilarity(query, references[i].embedding);
+        if (score > bestScore) {
+            bestScore = score;
+            bestLabel = references[i].label;
+        }
+    }
+    return bestLabel;
+}
+
+std::vector<std::vector<double>> computeRepresentationCentroids(
+    const std::vector<RepresentationAuditSample>& samples,
+    int numClasses) {
+    std::vector<std::vector<double>> centroids(static_cast<size_t>(numClasses));
+    std::vector<int> counts(static_cast<size_t>(numClasses), 0);
+    for (const auto& sample : samples) {
+        if (sample.label < 0 || sample.label >= numClasses || sample.embedding.empty()) {
+            continue;
+        }
+        auto& centroid = centroids[static_cast<size_t>(sample.label)];
+        if (centroid.empty()) {
+            centroid.assign(sample.embedding.size(), 0.0);
+        }
+        if (centroid.size() != sample.embedding.size()) {
+            continue;
+        }
+        for (size_t i = 0; i < centroid.size(); ++i) {
+            centroid[i] += sample.embedding[i];
+        }
+        ++counts[static_cast<size_t>(sample.label)];
+    }
+    for (size_t label = 0; label < centroids.size(); ++label) {
+        if (counts[label] <= 0 || centroids[label].empty()) {
+            continue;
+        }
+        const double scale = 1.0 / static_cast<double>(counts[label]);
+        for (double& value : centroids[label]) {
+            value *= scale;
+        }
+    }
+    return centroids;
+}
+
+RepresentationAuditMetrics evaluateRepresentationAuditMetrics(
+    std::string name,
+    std::string surface,
+    bool recurrent,
+    bool usesJepaEncoder,
+    const std::vector<RepresentationAuditSample>& trainEmbeddings,
+    const std::vector<RepresentationAuditSample>& testEmbeddings,
+    const std::vector<snnfw::jepa::JepaLatentSample>& trainSamples,
+    const std::vector<snnfw::jepa::JepaLatentSample>& testSamples,
+    int numClasses) {
+    RepresentationAuditMetrics metrics;
+    metrics.name = std::move(name);
+    metrics.surface = std::move(surface);
+    metrics.recurrent = recurrent;
+    metrics.usesJepaEncoder = usesJepaEncoder;
+    metrics.trainSampleCount = trainEmbeddings.size();
+    metrics.testSampleCount = testEmbeddings.size();
+    metrics.trainConsistency = computeTemporalConsistency(trainSamples);
+    metrics.testConsistency = computeTemporalConsistency(testSamples);
+
+    if (trainEmbeddings.empty()) {
+        metrics.note = "no training embeddings";
+        return metrics;
+    }
+    metrics.embeddingDim = trainEmbeddings.front().embedding.size();
+    if (metrics.embeddingDim == 0) {
+        metrics.note = "empty embedding dimension";
+        return metrics;
+    }
+    metrics.available = true;
+
+    int trainCorrect = 0;
+    int trainTested = 0;
+    for (size_t i = 0; i < trainEmbeddings.size(); ++i) {
+        if (trainEmbeddings[i].label < 0 || trainEmbeddings[i].label >= numClasses) {
+            continue;
+        }
+        const int predicted =
+            classifyNearestNeighbor(trainEmbeddings[i].embedding, trainEmbeddings, i);
+        if (predicted < 0) {
+            continue;
+        }
+        trainCorrect += (predicted == trainEmbeddings[i].label) ? 1 : 0;
+        ++trainTested;
+    }
+    if (trainTested > 0) {
+        metrics.trainLeaveOneOutAccuracy =
+            100.0 * static_cast<double>(trainCorrect) / static_cast<double>(trainTested);
+    }
+
+    int testCorrect = 0;
+    int testTested = 0;
+    const auto centroids = computeRepresentationCentroids(trainEmbeddings, numClasses);
+    int centroidCorrect = 0;
+    int centroidTested = 0;
+    double centroidMarginSum = 0.0;
+    int centroidMarginCount = 0;
+
+    for (const auto& sample : testEmbeddings) {
+        if (sample.label < 0 || sample.label >= numClasses) {
+            continue;
+        }
+
+        const int predicted = classifyNearestNeighbor(sample.embedding, trainEmbeddings);
+        if (predicted >= 0) {
+            testCorrect += (predicted == sample.label) ? 1 : 0;
+            ++testTested;
+        }
+
+        int bestCentroidLabel = -1;
+        double bestCentroidScore = -std::numeric_limits<double>::infinity();
+        double ownCentroidScore = -std::numeric_limits<double>::infinity();
+        double bestOtherCentroidScore = -std::numeric_limits<double>::infinity();
+        for (int label = 0; label < numClasses; ++label) {
+            const auto& centroid = centroids[static_cast<size_t>(label)];
+            if (centroid.empty() || centroid.size() != sample.embedding.size()) {
+                continue;
+            }
+            const double score = cosineSimilarity(sample.embedding, centroid);
+            if (score > bestCentroidScore) {
+                bestCentroidScore = score;
+                bestCentroidLabel = label;
+            }
+            if (label == sample.label) {
+                ownCentroidScore = score;
+            } else {
+                bestOtherCentroidScore = std::max(bestOtherCentroidScore, score);
+            }
+        }
+        if (bestCentroidLabel >= 0) {
+            centroidCorrect += (bestCentroidLabel == sample.label) ? 1 : 0;
+            ++centroidTested;
+        }
+        if (ownCentroidScore > -std::numeric_limits<double>::infinity() &&
+            bestOtherCentroidScore > -std::numeric_limits<double>::infinity()) {
+            centroidMarginSum += ownCentroidScore - bestOtherCentroidScore;
+            ++centroidMarginCount;
+        }
+    }
+
+    if (testTested > 0) {
+        metrics.testNearestNeighborAccuracy =
+            100.0 * static_cast<double>(testCorrect) / static_cast<double>(testTested);
+    }
+    if (centroidTested > 0) {
+        metrics.testCentroidAccuracy =
+            100.0 * static_cast<double>(centroidCorrect) / static_cast<double>(centroidTested);
+    }
+    if (centroidMarginCount > 0) {
+        metrics.testMeanCentroidMargin =
+            centroidMarginSum / static_cast<double>(centroidMarginCount);
+    }
+
+    return metrics;
+}
+
+RepresentationAuditReport runJepaRepresentationAudit(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& trainLoader,
+    const VisualDomainAdapter& testLoader,
+    const std::vector<size_t>& testIndices,
+    const Config& config,
+    const snnfw::jepa::JepaTrainingArtifacts* artifacts) {
+    RepresentationAuditReport report;
+    if (!config.jepaRepresentationAuditEnabled) {
+        return report;
+    }
+
+    auto buildSurfaceSamples =
+        [&](const Config& auditConfig,
+            bool trainingPhase) -> std::vector<snnfw::jepa::JepaLatentSample> {
+        auto taps = trainingPhase
+            ? buildJepaStage1TapInputs(hemispheres, trainLoader, auditConfig)
+            : buildJepaStage1EvalTapInputs(hemispheres, testLoader, testIndices, auditConfig);
+        return snnfw::jepa::buildStage1LatentSamples(taps, auditConfig.jepa);
+    };
+
+    auto appendDirectSurface =
+        [&](const std::string& name,
+            const std::string& surface,
+            bool recurrent,
+            const Config& auditConfig) {
+            const auto trainSamples = buildSurfaceSamples(auditConfig, true);
+            const auto testSamples = buildSurfaceSamples(auditConfig, false);
+            auto trainEmbeddings = buildDirectRepresentationSamples(trainSamples);
+            auto testEmbeddings = buildDirectRepresentationSamples(testSamples);
+            truncateRepresentationAuditSamples(
+                &trainEmbeddings, config.jepaRepresentationAuditSampleLimit);
+            truncateRepresentationAuditSamples(
+                &testEmbeddings, config.jepaRepresentationAuditSampleLimit);
+            report.metrics.push_back(evaluateRepresentationAuditMetrics(
+                name,
+                surface,
+                recurrent,
+                false,
+                trainEmbeddings,
+                testEmbeddings,
+                trainSamples,
+                testSamples,
+                config.numClasses));
+        };
+
+    Config rawConfig = config;
+    rawConfig.jepa.enabled = true;
+    rawConfig.jepa.includeHemisphereToken = true;
+    rawConfig.jepa.tapSurface = snnfw::jepa::TapSurface::RawStage1;
+    rawConfig.recurrentSensoryStateEnabled = false;
+    appendDirectSurface("Raw Stage1 Direct", "raw_stage1", false, rawConfig);
+
+    Config promotedConfig = config;
+    promotedConfig.jepa.enabled = true;
+    promotedConfig.jepa.includeHemisphereToken = true;
+    promotedConfig.jepa.tapSurface = snnfw::jepa::TapSurface::PromotedStage1;
+    promotedConfig.recurrentSensoryStateEnabled = false;
+    appendDirectSurface("Promoted Stage1 Direct", "promoted_stage1", false, promotedConfig);
+
+    Config recurrentConfig = config;
+    recurrentConfig.jepa.enabled = true;
+    recurrentConfig.jepa.includeHemisphereToken = true;
+    recurrentConfig.jepa.tapSurface = snnfw::jepa::TapSurface::PromotedStage1;
+    recurrentConfig.recurrentSensoryStateEnabled = true;
+    appendDirectSurface(
+        "Recurrent Fixation Direct", "promoted_stage1_recurrent", true, recurrentConfig);
+
+    RepresentationAuditMetrics jepaMetrics;
+    jepaMetrics.name = "JEPA Embedding";
+    jepaMetrics.surface = snnfw::jepa::tapSurfaceName(config.jepa.tapSurface);
+    jepaMetrics.recurrent = config.recurrentSensoryStateEnabled;
+    jepaMetrics.usesJepaEncoder = true;
+    if (artifacts == nullptr) {
+        jepaMetrics.note = "no JEPA model available";
+        report.metrics.push_back(std::move(jepaMetrics));
+    } else {
+        const auto trainSamples = buildSurfaceSamples(config, true);
+        const auto testSamples = buildSurfaceSamples(config, false);
+        auto trainEmbeddings = buildJepaRepresentationSamples(trainSamples, artifacts->model);
+        auto testEmbeddings = buildJepaRepresentationSamples(testSamples, artifacts->model);
+        truncateRepresentationAuditSamples(
+            &trainEmbeddings, config.jepaRepresentationAuditSampleLimit);
+        truncateRepresentationAuditSamples(
+            &testEmbeddings, config.jepaRepresentationAuditSampleLimit);
+        report.metrics.push_back(evaluateRepresentationAuditMetrics(
+            "JEPA Embedding",
+            snnfw::jepa::tapSurfaceName(config.jepa.tapSurface),
+            config.recurrentSensoryStateEnabled,
+            true,
+            trainEmbeddings,
+            testEmbeddings,
+            trainSamples,
+            testSamples,
+            config.numClasses));
+    }
+
+    const std::string outputPath = defaultJepaRepresentationAuditOutputPath(config);
+    report.outputPath = outputPath;
+    nlohmann::json root;
+    root["input_domain"] = config.inputDomain;
+    root["input_variant"] = config.inputVariant;
+    root["test_limit"] = config.testLimit;
+    root["examples_per_class"] = config.examplesPerClass;
+    root["config_path"] = config.configPath;
+    root["current_jepa_surface"] = snnfw::jepa::tapSurfaceName(config.jepa.tapSurface);
+    root["current_jepa_target_mode"] = snnfw::jepa::targetModeName(config.jepa.targetMode);
+    root["current_recurrent_sensory_state"] = config.recurrentSensoryStateEnabled;
+    root["audit_sample_limit"] = config.jepaRepresentationAuditSampleLimit;
+    if (artifacts != nullptr) {
+        root["jepa_training_summary"] = {
+            {"projection_dim", artifacts->summary.projectionDim},
+            {"training_example_count", artifacts->summary.trainingExampleCount},
+            {"temporal_example_count", artifacts->summary.temporalExampleCount},
+            {"fallback_masked_example_count", artifacts->summary.fallbackMaskedExampleCount},
+            {"mean_loss", artifacts->summary.meanLoss},
+            {"mean_shuffled_loss", artifacts->summary.meanShuffledLoss},
+            {"context_variance", artifacts->summary.contextVariance},
+            {"prediction_variance", artifacts->summary.predictionVariance},
+            {"target_variance", artifacts->summary.targetVariance},
+        };
+    }
+
+    root["representations"] = nlohmann::json::array();
+    for (const auto& metrics : report.metrics) {
+        root["representations"].push_back({
+            {"name", metrics.name},
+            {"surface", metrics.surface},
+            {"recurrent", metrics.recurrent},
+            {"uses_jepa_encoder", metrics.usesJepaEncoder},
+            {"available", metrics.available},
+            {"note", metrics.note},
+            {"train_sample_count", metrics.trainSampleCount},
+            {"test_sample_count", metrics.testSampleCount},
+            {"embedding_dim", metrics.embeddingDim},
+            {"train_leave_one_out_accuracy", metrics.trainLeaveOneOutAccuracy},
+            {"test_nearest_neighbor_accuracy", metrics.testNearestNeighborAccuracy},
+            {"test_centroid_accuracy", metrics.testCentroidAccuracy},
+            {"test_mean_centroid_margin", metrics.testMeanCentroidMargin},
+            {"train_adjacent_fixation_cosine", metrics.trainConsistency.adjacentMeanCosine},
+            {"train_all_pair_fixation_cosine", metrics.trainConsistency.allPairMeanCosine},
+            {"train_fixation_groups", metrics.trainConsistency.groupedSequenceCount},
+            {"test_adjacent_fixation_cosine", metrics.testConsistency.adjacentMeanCosine},
+            {"test_all_pair_fixation_cosine", metrics.testConsistency.allPairMeanCosine},
+            {"test_fixation_groups", metrics.testConsistency.groupedSequenceCount},
+        });
+    }
+
+    const std::filesystem::path path(outputPath);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("Failed to open JEPA representation audit path: " + outputPath);
+    }
+    out << root.dump(2) << '\n';
+
+    std::cout << "\n=== JEPA Representation Audit ===" << std::endl;
+    for (const auto& metrics : report.metrics) {
+        std::cout << "  " << metrics.name << ": ";
+        if (!metrics.available) {
+            std::cout << "skipped";
+            if (!metrics.note.empty()) {
+                std::cout << " (" << metrics.note << ")";
+            }
+            std::cout << std::endl;
+            continue;
+        }
+        std::cout << "test_nn=" << std::fixed << std::setprecision(2)
+                  << metrics.testNearestNeighborAccuracy
+                  << "%, train_loo=" << metrics.trainLeaveOneOutAccuracy
+                  << "%, centroid_margin=" << metrics.testMeanCentroidMargin
+                  << ", test_fix_adj=" << metrics.testConsistency.adjacentMeanCosine
+                  << ", dim=" << metrics.embeddingDim << std::endl;
+    }
+    std::cout << "  Audit path: " << outputPath << std::endl;
+    return report;
 }
 
 VisualStimulus applyImageFocusTransform(const VisualStimulus& image,
@@ -1515,6 +2257,60 @@ std::string toLower(std::string value) {
     return value;
 }
 
+std::vector<double> buildJepaTapPattern(HemisphereRuntime& hemisphere,
+                                        const VisualStimulus& image,
+                                        const Config& config,
+                                        bool useRawStage1) {
+    auto rawPattern = extractPattern(
+        hemisphere.retinas,
+        image,
+        config,
+        false,
+        false,
+        0U,
+        nullptr);
+    if (useRawStage1 || rawPattern.empty()) {
+        return rawPattern;
+    }
+
+    FigureGroundState figureGroundState;
+    if (useFigureGroundStage(config)) {
+        figureGroundState = buildHemisphereFigureGroundState(hemisphere, rawPattern, config);
+    }
+    auto promotedPattern = buildHemisphereClassifierPattern(
+        hemisphere,
+        rawPattern,
+        config,
+        figureGroundState.valid ? &figureGroundState : nullptr);
+    return promotedPattern.empty() ? rawPattern : promotedPattern;
+}
+
+std::vector<std::vector<double>> buildJepaTemporalTapPatterns(HemisphereRuntime& hemisphere,
+                                                              const VisualStimulus& image,
+                                                              const Config& config,
+                                                              bool useRawStage1,
+                                                              bool trainingPhase,
+                                                              size_t sampleSeed) {
+    std::vector<std::vector<double>> patterns;
+    if (!useRawStage1 && useRecurrentSensoryState(config)) {
+        auto recurrentResult = buildRecurrentSensoryPattern(
+            hemisphere, image, config, trainingPhase, sampleSeed);
+        if (!recurrentResult.fixationPatterns.empty()) {
+            return recurrentResult.fixationPatterns;
+        }
+    }
+
+    const auto fixationImages =
+        trainingPhase
+            ? buildExtractionStimuli(image, config, true, sampleSeed, &hemisphere.retinas)
+            : buildSaccadeStimuli(image, config, true, &hemisphere.retinas);
+    patterns.reserve(fixationImages.size());
+    for (const auto& fixationImage : fixationImages) {
+        patterns.push_back(buildJepaTapPattern(hemisphere, fixationImage, config, useRawStage1));
+    }
+    return patterns;
+}
+
 std::vector<Stage1TapInput> buildJepaStage1TapInputs(
     std::vector<HemisphereRuntime>& hemispheres,
     const VisualDomainAdapter& trainLoader,
@@ -1527,12 +2323,13 @@ std::vector<Stage1TapInput> buildJepaStage1TapInputs(
     const bool useRawStage1 =
         config.jepa.tapSurface == snnfw::jepa::TapSurface::RawStage1;
     const std::string surfaceName = useRawStage1 ? "raw_stage1" : "promoted_stage1";
-    const bool temporalFixationMode =
-        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalFixation &&
-        config.saccadeFixations > 1;
+    const bool temporalTargetMode =
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalFixation ||
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalHemisphereSummary;
+    const bool useTemporalFixationTaps = temporalTargetMode && config.saccadeFixations > 1;
 
     for (auto& hemisphere : hemispheres) {
-        if (temporalFixationMode && !hemisphere.trainingSourceIndices.empty()) {
+        if (useTemporalFixationTaps && !hemisphere.trainingSourceIndices.empty()) {
             std::vector<size_t> uniqueSourceIndices;
             uniqueSourceIndices.reserve(hemisphere.trainingSourceIndices.size());
             std::unordered_set<size_t> seenSources;
@@ -1553,23 +2350,23 @@ std::vector<Stage1TapInput> buildJepaStage1TapInputs(
                     hemisphere.retinaPatternSizes = inferHemisphereBranchPatternSizes(
                         hemisphere.retinas, image, config.useFeatures);
                 }
-                const auto fixationImages =
-                    buildExtractionStimuli(image, config, true, sourceIndex, &hemisphere.retinas);
-                for (size_t fixationIndex = 0; fixationIndex < fixationImages.size(); ++fixationIndex) {
+                const auto fixationPatterns = buildJepaTemporalTapPatterns(
+                    hemisphere,
+                    image,
+                    config,
+                    useRawStage1,
+                    true,
+                    sourceIndex);
+                for (size_t fixationIndex = 0;
+                     fixationIndex < fixationPatterns.size();
+                     ++fixationIndex) {
                     Stage1TapInput tap;
                     tap.hemisphereName = hemisphere.name;
                     tap.surfaceName = surfaceName;
                     tap.label = image.label;
                     tap.sourceIndex = sourceIndex;
                     tap.sourceViewIndex = fixationIndex;
-                    tap.pattern = extractPattern(
-                        hemisphere.retinas,
-                        fixationImages[fixationIndex],
-                        config,
-                        false,
-                        false,
-                        0U,
-                        nullptr);
+                    tap.pattern = fixationPatterns[fixationIndex];
                     tap.branchSizes = hemisphere.retinaPatternSizes;
                     const size_t branchTotal = std::accumulate(
                         tap.branchSizes.begin(), tap.branchSizes.end(), static_cast<size_t>(0));
@@ -1640,12 +2437,52 @@ std::vector<Stage1TapInput> buildJepaStage1EvalTapInputs(
     const bool useRawStage1 =
         config.jepa.tapSurface == snnfw::jepa::TapSurface::RawStage1;
     const std::string surfaceName = useRawStage1 ? "raw_stage1" : "promoted_stage1";
+    const bool temporalTargetMode =
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalFixation ||
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalHemisphereSummary;
+    const bool useTemporalFixationTaps = temporalTargetMode && config.saccadeFixations > 1;
     taps.reserve(indices.size() * hemispheres.size());
 
     for (size_t sourceIndex : indices) {
         const auto& image = loader.getStimulus(sourceIndex);
         const int label = image.label;
         if (label < 0 || label >= config.numClasses) {
+            continue;
+        }
+
+        if (useTemporalFixationTaps) {
+            for (auto& hemisphere : hemispheres) {
+                if (hemisphere.retinaPatternSizes.empty()) {
+                    hemisphere.retinaPatternSizes = inferHemisphereBranchPatternSizes(
+                        hemisphere.retinas, image, config.useFeatures);
+                }
+
+                const auto fixationPatterns = buildJepaTemporalTapPatterns(
+                    hemisphere,
+                    image,
+                    config,
+                    useRawStage1,
+                    false,
+                    sourceIndex);
+                for (size_t fixationIndex = 0;
+                     fixationIndex < fixationPatterns.size();
+                     ++fixationIndex) {
+                    Stage1TapInput tap;
+                    tap.hemisphereName = hemisphere.name;
+                    tap.surfaceName = surfaceName;
+                    tap.label = label;
+                    tap.sourceIndex = sourceIndex;
+                    tap.sourceViewIndex = fixationIndex;
+                    tap.pattern = fixationPatterns[fixationIndex];
+                    tap.branchSizes = hemisphere.retinaPatternSizes;
+                    const size_t branchTotal = std::accumulate(
+                        tap.branchSizes.begin(), tap.branchSizes.end(), static_cast<size_t>(0));
+                    if (branchTotal != tap.pattern.size()) {
+                        tap.branchSizes.clear();
+                    }
+                    taps.push_back(std::move(tap));
+                }
+            }
             continue;
         }
 
@@ -1701,6 +2538,10 @@ void maybeExportJepaStage1Taps(std::vector<HemisphereRuntime>& hemispheres,
     if (!config.jepa.enabled) {
         return;
     }
+    if (!config.jepa.exportEnabled) {
+        std::cout << "  JEPA stage1 tap export skipped: export disabled" << std::endl;
+        return;
+    }
 
     auto taps = buildJepaStage1TapInputs(hemispheres, trainLoader, config);
     if (taps.empty()) {
@@ -1751,6 +2592,7 @@ bool maybeTrainJepaModel(std::vector<HemisphereRuntime>& hemispheres,
               << ", projection_dim=" << summary.projectionDim
               << ", loss=" << std::fixed << std::setprecision(4) << summary.meanLoss
               << ", shuffled_loss=" << summary.meanShuffledLoss
+              << ", context_var=" << summary.contextVariance
               << ", pred_var=" << summary.predictionVariance
               << ", target_var=" << summary.targetVariance
               << ", variance_penalty=" << summary.meanVariancePenalty
@@ -1789,8 +2631,20 @@ JepaProbeResult evaluateJepaProbe(std::vector<HemisphereRuntime>& hemispheres,
         throw std::runtime_error("JEPA probe found no valid training embeddings");
     }
 
-    auto classifier = makeClassifierStrategy(
-        config.classifier, config.knnK, config.classifierExponent, config);
+    const bool useMlpProbe = config.jepa.probeMode == "mlp";
+    std::unique_ptr<ClassificationStrategy> classifier;
+    std::optional<ProbeMlp> mlpProbe;
+    if (useMlpProbe) {
+        mlpProbe = trainProbeMlp(trainingPatterns,
+                                 config.numClasses,
+                                 config.jepa.probeHiddenDim,
+                                 config.jepa.probeEpochs,
+                                 config.jepa.probeLearningRate,
+                                 config.seed);
+    } else {
+        classifier = makeClassifierStrategy(
+            config.classifier, config.knnK, config.classifierExponent, config);
+    }
     const auto evalTaps = buildJepaStage1EvalTapInputs(hemispheres, testLoader, indices, config);
     const auto evalSamples = snnfw::jepa::buildStage1LatentSamples(evalTaps, config.jepa);
     const int maxTests = static_cast<int>(evalSamples.size());
@@ -1805,8 +2659,9 @@ JepaProbeResult evaluateJepaProbe(std::vector<HemisphereRuntime>& hemispheres,
             continue;
         }
 
-        const int predicted =
-            classifier->classify(embedding, trainingPatterns, cosineSimilarity);
+        const int predicted = useMlpProbe
+            ? classifyWithProbeMlp(*mlpProbe, embedding)
+            : classifier->classify(embedding, trainingPatterns, cosineSimilarity);
         result.confusion[static_cast<size_t>(sample.label)][static_cast<size_t>(predicted)]++;
         result.correct += (predicted == sample.label) ? 1 : 0;
         result.tested++;
@@ -2534,6 +3389,24 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
     if (flowAuditOutputPrefixIt != irConfig.stringParams.end()) {
         config.flowAuditOutputPrefix = trim(flowAuditOutputPrefixIt->second);
     }
+    const auto jepaRepresentationAuditEnabledIt =
+        irConfig.intParams.find("jepa_representation_audit_enabled");
+    if (jepaRepresentationAuditEnabledIt != irConfig.intParams.end()) {
+        config.jepaRepresentationAuditEnabled =
+            jepaRepresentationAuditEnabledIt->second != 0;
+    }
+    const auto jepaRepresentationAuditSampleLimitIt =
+        irConfig.intParams.find("jepa_representation_audit_sample_limit");
+    if (jepaRepresentationAuditSampleLimitIt != irConfig.intParams.end()) {
+        config.jepaRepresentationAuditSampleLimit =
+            std::max(0, jepaRepresentationAuditSampleLimitIt->second);
+    }
+    const auto jepaRepresentationAuditOutputPathIt =
+        irConfig.stringParams.find("jepa_representation_audit_output_path");
+    if (jepaRepresentationAuditOutputPathIt != irConfig.stringParams.end()) {
+        config.jepaRepresentationAuditOutputPath =
+            trim(jepaRepresentationAuditOutputPathIt->second);
+    }
     const auto jepaDumpPathIt = irConfig.stringParams.find("jepa_dump_path");
     if (jepaDumpPathIt != irConfig.stringParams.end()) {
         config.jepa.dumpPath = trim(jepaDumpPathIt->second);
@@ -2552,6 +3425,10 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
     const auto jepaEnabledIt = irConfig.intParams.find("jepa_enabled");
     if (jepaEnabledIt != irConfig.intParams.end()) {
         config.jepa.enabled = jepaEnabledIt->second != 0;
+    }
+    const auto jepaExportEnabledIt = irConfig.intParams.find("jepa_export_enabled");
+    if (jepaExportEnabledIt != irConfig.intParams.end()) {
+        config.jepa.exportEnabled = jepaExportEnabledIt->second != 0;
     }
     const auto jepaTrainerEnabledIt = irConfig.intParams.find("jepa_trainer_enabled");
     if (jepaTrainerEnabledIt != irConfig.intParams.end()) {
@@ -2620,9 +3497,15 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
             config.jepa.targetMode = snnfw::jepa::TargetMode::BranchMask;
         } else if (value == "temporal_fixation") {
             config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalFixation;
+        } else if (value == "temporal_hemisphere_summary") {
+            config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalHemisphereSummary;
         } else {
             throw std::runtime_error("Unsupported jepa_target_mode: " + value);
         }
+    }
+    const auto jepaProbeModeIt = irConfig.stringParams.find("jepa_probe_mode");
+    if (jepaProbeModeIt != irConfig.stringParams.end()) {
+        config.jepa.probeMode = toLower(trim(jepaProbeModeIt->second));
     }
     const auto jepaTrainerDumpPathIt =
         irConfig.stringParams.find("jepa_trainer_dump_path");
@@ -2654,6 +3537,41 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
         irConfig.doubleParams.find("jepa_variance_penalty");
     if (jepaVariancePenaltyIt != irConfig.doubleParams.end()) {
         config.jepa.variancePenalty = std::max(0.0, jepaVariancePenaltyIt->second);
+    }
+    const auto jepaMseLossWeightIt =
+        irConfig.doubleParams.find("jepa_mse_loss_weight");
+    if (jepaMseLossWeightIt != irConfig.doubleParams.end()) {
+        config.jepa.mseLossWeight = std::max(0.0, jepaMseLossWeightIt->second);
+    }
+    const auto jepaCosineLossWeightIt =
+        irConfig.doubleParams.find("jepa_cosine_loss_weight");
+    if (jepaCosineLossWeightIt != irConfig.doubleParams.end()) {
+        config.jepa.cosineLossWeight = std::max(0.0, jepaCosineLossWeightIt->second);
+    }
+    const auto jepaMetadataScaleIt =
+        irConfig.doubleParams.find("jepa_metadata_scale");
+    if (jepaMetadataScaleIt != irConfig.doubleParams.end()) {
+        config.jepa.metadataScale = std::max(0.0, jepaMetadataScaleIt->second);
+    }
+    const auto jepaEncodeViewMetadataIt =
+        irConfig.intParams.find("jepa_encode_view_metadata");
+    if (jepaEncodeViewMetadataIt != irConfig.intParams.end()) {
+        config.jepa.encodeViewMetadata = jepaEncodeViewMetadataIt->second != 0;
+    }
+    const auto jepaProbeHiddenDimIt =
+        irConfig.intParams.find("jepa_probe_hidden_dim");
+    if (jepaProbeHiddenDimIt != irConfig.intParams.end()) {
+        config.jepa.probeHiddenDim = std::max(1, jepaProbeHiddenDimIt->second);
+    }
+    const auto jepaProbeEpochsIt =
+        irConfig.intParams.find("jepa_probe_epochs");
+    if (jepaProbeEpochsIt != irConfig.intParams.end()) {
+        config.jepa.probeEpochs = std::max(1, jepaProbeEpochsIt->second);
+    }
+    const auto jepaProbeLearningRateIt =
+        irConfig.doubleParams.find("jepa_probe_learning_rate");
+    if (jepaProbeLearningRateIt != irConfig.doubleParams.end()) {
+        config.jepa.probeLearningRate = std::max(0.0, jepaProbeLearningRateIt->second);
     }
     const auto focusAdjustmentEnabledIt = irConfig.intParams.find("focus_adjustment_enabled");
     if (focusAdjustmentEnabledIt != irConfig.intParams.end()) {
@@ -11617,6 +12535,12 @@ Config parseArgs(int argc, char* argv[]) {
             config.flowAuditSampleLimit = std::max(0, std::atoi(argv[++i]));
         } else if (arg == "--flow-audit-output-prefix" && i + 1 < argc) {
             config.flowAuditOutputPrefix = argv[++i];
+        } else if (arg == "--jepa-representation-audit-enabled") {
+            config.jepaRepresentationAuditEnabled = true;
+        } else if (arg == "--jepa-representation-audit-sample-limit" && i + 1 < argc) {
+            config.jepaRepresentationAuditSampleLimit = std::max(0, std::atoi(argv[++i]));
+        } else if (arg == "--jepa-representation-audit-output-path" && i + 1 < argc) {
+            config.jepaRepresentationAuditOutputPath = argv[++i];
         } else if (arg == "--use-features") {
             config.useFeatures = true;
         } else if (arg == "--use-activations") {
@@ -11760,6 +12684,9 @@ Config parseArgs(int argc, char* argv[]) {
                 << "  --flow-audit-enabled\n"
                 << "  --flow-audit-sample-limit <n>\n"
                 << "  --flow-audit-output-prefix <path-prefix>\n"
+                << "  --jepa-representation-audit-enabled\n"
+                << "  --jepa-representation-audit-sample-limit <n>\n"
+                << "  --jepa-representation-audit-output-path <path>\n"
                 << "  --focus-groups <A,B;C,D;...>\n"
                 << "  --focus-limit-per-label <n>\n"
                 << "  --focus-only\n"
@@ -11807,6 +12734,7 @@ int main(int argc, char* argv[]) {
                       << ", mask_mode=" << snnfw::jepa::maskModeName(config.jepa.maskMode)
                       << ", target_mode="
                       << snnfw::jepa::targetModeName(config.jepa.targetMode)
+                      << ", export=" << (config.jepa.exportEnabled ? "on" : "off")
                       << ", visible_branches=" << config.jepa.visibleBranchCount
                       << ", hidden_branches=" << config.jepa.hiddenBranchCount
                       << ", max_samples=" << config.jepa.maxSamples
@@ -11825,12 +12753,26 @@ int main(int argc, char* argv[]) {
                       << ", lr=" << config.jepa.trainerLearningRate
                       << ", weight_decay=" << config.jepa.trainerWeightDecay
                       << ", target_ema_decay=" << config.jepa.targetEmaDecay
+                      << ", mse_weight=" << config.jepa.mseLossWeight
+                      << ", cosine_weight=" << config.jepa.cosineLossWeight
                       << ", variance_floor=" << config.jepa.varianceFloor
                       << ", variance_penalty=" << config.jepa.variancePenalty
+                      << ", metadata=" << (config.jepa.encodeViewMetadata ? "on" : "off")
+                      << ", metadata_scale=" << config.jepa.metadataScale
                       << ", path=" << trainerPath << ")"
                       << std::endl;
             std::cout << "  JEPA probe: "
-                      << (config.jepa.probeEnabled ? "enabled" : "disabled")
+                      << (config.jepa.probeEnabled ? "enabled" : "disabled");
+            if (config.jepa.probeEnabled) {
+                std::cout << " (mode=" << config.jepa.probeMode;
+                if (config.jepa.probeMode == "mlp") {
+                    std::cout << ", hidden_dim=" << config.jepa.probeHiddenDim
+                              << ", epochs=" << config.jepa.probeEpochs
+                              << ", lr=" << config.jepa.probeLearningRate;
+                }
+                std::cout << ")";
+            }
+            std::cout
                       << std::endl;
         }
         for (const auto& retinaConfig : retinaConfigs) {
@@ -12058,6 +13000,13 @@ int main(int argc, char* argv[]) {
                       << (defaultFlowAuditOutputPrefix(config).empty()
                               ? std::string("<none>")
                               : defaultFlowAuditOutputPrefix(config))
+                      << ", jepa_rep_audit="
+                      << (config.jepaRepresentationAuditEnabled ? "on" : "off")
+                      << ", jepa_rep_audit_limit=" << config.jepaRepresentationAuditSampleLimit
+                      << ", jepa_rep_audit_path="
+                      << (defaultJepaRepresentationAuditOutputPath(config).empty()
+                              ? std::string("<none>")
+                              : defaultJepaRepresentationAuditOutputPath(config))
                       << ", fusion_path=" << (config.fusionPath.empty() ? "<none>" : config.fusionPath)
                       << std::endl;
         }
@@ -12692,6 +13641,16 @@ int main(int argc, char* argv[]) {
                               << std::endl;
                     printPerClassAccuracy(jepaProbeEval->confusion, config);
                     printTopConfusions(jepaProbeEval->confusion, config);
+                }
+
+                if (config.jepaRepresentationAuditEnabled) {
+                    runJepaRepresentationAudit(
+                        hemispheres,
+                        *trainLoader,
+                        *testLoader,
+                        selectedTestIndices,
+                        config,
+                        hasJepaModel ? &jepaArtifacts : nullptr);
                 }
             }
 

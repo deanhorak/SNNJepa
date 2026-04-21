@@ -29,6 +29,11 @@ struct TrainingExample {
     std::vector<double> target;
 };
 
+struct BatchMoments {
+    std::vector<double> mean;
+    std::vector<double> variance;
+};
+
 struct LinearGradients {
     std::vector<std::vector<double>> weightGradients;
     std::vector<double> biasGradients;
@@ -41,6 +46,44 @@ uint64_t mixFeatureKey(uint64_t value) {
     value *= 0xc4ceb9fe1a85ec53ULL;
     value ^= value >> 33U;
     return value;
+}
+
+uint64_t hashString(const std::string& value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : value) {
+        hash ^= static_cast<uint64_t>(ch);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::vector<double> projectMetadata(const std::string& hemisphereName,
+                                    const std::string& surfaceName,
+                                    size_t sourceViewIndex,
+                                    size_t dim,
+                                    double scale) {
+    std::vector<double> projection(dim, 0.0);
+    if (dim == 0 || scale <= 0.0) {
+        return projection;
+    }
+
+    const uint64_t hemisphereHash = hashString(hemisphereName);
+    const uint64_t surfaceHash = hashString(surfaceName);
+    const uint64_t fixationHash = mixFeatureKey(static_cast<uint64_t>(sourceViewIndex + 1));
+    const uint64_t keys[] = {
+        hemisphereHash,
+        surfaceHash,
+        fixationHash,
+        mixFeatureKey(hemisphereHash ^ (surfaceHash << 1U) ^ fixationHash),
+    };
+
+    for (uint64_t key : keys) {
+        const size_t bucket = static_cast<size_t>(mixFeatureKey(key) % dim);
+        const double sign = (key & 1ULL) == 0 ? 1.0 : -1.0;
+        projection[bucket] += sign * scale;
+    }
+
+    return projection;
 }
 
 std::vector<double> projectTokens(const std::vector<JepaLatentToken>& tokens, size_t dim) {
@@ -94,8 +137,16 @@ std::vector<double> projectVector(const std::vector<double>& values, size_t dim)
     return projection;
 }
 
+void addInPlace(std::vector<double>* dst, const std::vector<double>& src) {
+    const size_t count = std::min(dst->size(), src.size());
+    for (size_t i = 0; i < count; ++i) {
+        (*dst)[i] += src[i];
+    }
+}
+
 std::vector<TrainingExample> buildMaskedExamples(const std::vector<JepaLatentSample>& samples,
-                                                 size_t projectionDim) {
+                                                 size_t projectionDim,
+                                                 const JepaConfig& config) {
     std::vector<TrainingExample> examples;
     for (const auto& sample : samples) {
         for (const auto& maskedView : sample.maskedViews) {
@@ -114,6 +165,15 @@ std::vector<TrainingExample> buildMaskedExamples(const std::vector<JepaLatentSam
             example.targetMode = "branch_mask";
             example.visible = projectTokens(maskedView.visibleBranchTokens, projectionDim);
             example.target = projectTokens(maskedView.hiddenBranchTokens, projectionDim);
+            if (config.encodeViewMetadata) {
+                const auto metadata = projectMetadata(maskedView.hemisphereName,
+                                                      maskedView.surfaceName,
+                                                      maskedView.sourceViewIndex,
+                                                      projectionDim,
+                                                      config.metadataScale);
+                addInPlace(&example.visible, metadata);
+                addInPlace(&example.target, metadata);
+            }
             examples.push_back(std::move(example));
         }
     }
@@ -121,7 +181,8 @@ std::vector<TrainingExample> buildMaskedExamples(const std::vector<JepaLatentSam
 }
 
 std::vector<TrainingExample> buildTemporalExamples(const std::vector<JepaLatentSample>& samples,
-                                                   size_t projectionDim) {
+                                                   size_t projectionDim,
+                                                   const JepaConfig& config) {
     std::vector<TrainingExample> examples;
     for (const auto& sample : samples) {
         std::unordered_map<std::string, std::vector<size_t>> groupedViewIndices;
@@ -141,9 +202,9 @@ std::vector<TrainingExample> buildTemporalExamples(const std::vector<JepaLatentS
                           return sample.hemisphereViews[lhs].sourceViewIndex <
                                  sample.hemisphereViews[rhs].sourceViewIndex;
                       });
-            for (size_t i = 0; i < indices.size(); ++i) {
+            for (size_t i = 0; i + 1 < indices.size(); ++i) {
                 const size_t sourceViewIdx = indices[i];
-                const size_t targetViewIdx = indices[(i + 1) % indices.size()];
+                const size_t targetViewIdx = indices[i + 1];
                 const auto& sourceView = sample.hemisphereViews[sourceViewIdx];
                 const auto& targetView = sample.hemisphereViews[targetViewIdx];
 
@@ -160,7 +221,9 @@ std::vector<TrainingExample> buildTemporalExamples(const std::vector<JepaLatentS
                 }
 
                 std::vector<double> target;
-                if (!targetView.branchTokens.empty()) {
+                if (config.targetMode == TargetMode::TemporalHemisphereSummary) {
+                    target = projectVector(targetView.hemisphereToken, projectionDim);
+                } else if (!targetView.branchTokens.empty()) {
                     target = projectTokens(targetView.branchTokens, projectionDim);
                 } else {
                     target = projectVector(targetView.hemisphereToken, projectionDim);
@@ -172,9 +235,23 @@ std::vector<TrainingExample> buildTemporalExamples(const std::vector<JepaLatentS
                 example.hemisphereName = sourceView.hemisphereName;
                 example.surfaceName = sourceView.surfaceName;
                 example.sourceViewIndex = sourceView.sourceViewIndex;
-                example.targetMode = "temporal_fixation";
+                example.targetMode = targetModeName(config.targetMode);
                 example.visible = std::move(visible);
                 example.target = std::move(target);
+                if (config.encodeViewMetadata) {
+                    const auto sourceMetadata = projectMetadata(sourceView.hemisphereName,
+                                                                sourceView.surfaceName,
+                                                                sourceView.sourceViewIndex,
+                                                                projectionDim,
+                                                                config.metadataScale);
+                    const auto targetMetadata = projectMetadata(targetView.hemisphereName,
+                                                                targetView.surfaceName,
+                                                                targetView.sourceViewIndex,
+                                                                projectionDim,
+                                                                config.metadataScale);
+                    addInPlace(&example.visible, sourceMetadata);
+                    addInPlace(&example.target, targetMetadata);
+                }
                 examples.push_back(std::move(example));
             }
         }
@@ -326,6 +403,81 @@ double meanNorm(const std::vector<std::vector<double>>& embeddings) {
     return total / static_cast<double>(embeddings.size());
 }
 
+BatchMoments computeBatchMoments(const std::vector<std::vector<double>>& embeddings) {
+    BatchMoments moments;
+    if (embeddings.empty() || embeddings.front().empty()) {
+        return moments;
+    }
+
+    const size_t dim = embeddings.front().size();
+    moments.mean.assign(dim, 0.0);
+    moments.variance.assign(dim, 0.0);
+    for (const auto& embedding : embeddings) {
+        for (size_t i = 0; i < dim; ++i) {
+            moments.mean[i] += embedding[i];
+        }
+    }
+    for (double& value : moments.mean) {
+        value /= static_cast<double>(embeddings.size());
+    }
+    for (const auto& embedding : embeddings) {
+        for (size_t i = 0; i < dim; ++i) {
+            const double delta = embedding[i] - moments.mean[i];
+            moments.variance[i] += delta * delta;
+        }
+    }
+    for (double& value : moments.variance) {
+        value /= static_cast<double>(embeddings.size());
+    }
+    return moments;
+}
+
+std::vector<double> cosineGradient(const std::vector<double>& prediction,
+                                   const std::vector<double>& target) {
+    const size_t count = std::min(prediction.size(), target.size());
+    std::vector<double> gradient(count, 0.0);
+    if (count == 0) {
+        return gradient;
+    }
+
+    double dot = 0.0;
+    double predNormSq = 0.0;
+    double targetNormSq = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        dot += prediction[i] * target[i];
+        predNormSq += prediction[i] * prediction[i];
+        targetNormSq += target[i] * target[i];
+    }
+
+    const double predNorm = std::sqrt(std::max(predNormSq, 1e-12));
+    const double targetNorm = std::sqrt(std::max(targetNormSq, 1e-12));
+    const double denom = predNorm * targetNorm;
+    if (denom <= 1e-12) {
+        return gradient;
+    }
+
+    const double invDenom = 1.0 / denom;
+    const double dotOverPredNormSq = dot / std::max(predNormSq, 1e-12);
+    for (size_t i = 0; i < count; ++i) {
+        gradient[i] = -((target[i] * invDenom) -
+                        (dotOverPredNormSq * prediction[i] * invDenom));
+    }
+    return gradient;
+}
+
+double meanSquaredError(const std::vector<double>& lhs, const std::vector<double>& rhs) {
+    const size_t count = std::min(lhs.size(), rhs.size());
+    if (count == 0) {
+        return 0.0;
+    }
+    double total = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double delta = lhs[i] - rhs[i];
+        total += delta * delta;
+    }
+    return total / static_cast<double>(count);
+}
+
 json summaryToJson(const JepaTrainingSummary& summary,
                    const JepaConfig& config,
                    const std::vector<TrainingExample>& examples) {
@@ -358,6 +510,7 @@ json summaryToJson(const JepaTrainingSummary& summary,
         {"mean_context_norm", summary.meanContextNorm},
         {"mean_target_norm", summary.meanTargetNorm},
         {"mean_prediction_norm", summary.meanPredictionNorm},
+        {"context_variance", summary.contextVariance},
         {"target_variance", summary.targetVariance},
         {"prediction_variance", summary.predictionVariance},
         {"context_encoder_weight_norm", summary.contextEncoderWeightNorm},
@@ -368,6 +521,10 @@ json summaryToJson(const JepaTrainingSummary& summary,
         {"learning_rate", config.trainerLearningRate},
         {"weight_decay", config.trainerWeightDecay},
         {"target_ema_decay", config.targetEmaDecay},
+        {"mse_loss_weight", config.mseLossWeight},
+        {"cosine_loss_weight", config.cosineLossWeight},
+        {"encode_view_metadata", config.encodeViewMetadata},
+        {"metadata_scale", config.metadataScale},
         {"preview_examples", std::move(preview)},
     };
 }
@@ -390,6 +547,47 @@ std::vector<const JepaHemisphereView*> sortViews(const JepaLatentSample& sample)
                   return lhs->sourceViewIndex < rhs->sourceViewIndex;
               });
     return views;
+}
+
+std::vector<double> meanPool(const std::vector<std::vector<double>>& embeddings, size_t dim) {
+    std::vector<double> pooled(dim, 0.0);
+    if (embeddings.empty() || dim == 0) {
+        return pooled;
+    }
+    for (const auto& embedding : embeddings) {
+        for (size_t i = 0; i < std::min(dim, embedding.size()); ++i) {
+            pooled[i] += embedding[i];
+        }
+    }
+    const double scale = 1.0 / static_cast<double>(embeddings.size());
+    for (double& value : pooled) {
+        value *= scale;
+    }
+    return pooled;
+}
+
+std::vector<double> variancePool(const std::vector<std::vector<double>>& embeddings,
+                                 const std::vector<double>& mean,
+                                 size_t dim) {
+    std::vector<double> pooled(dim, 0.0);
+    if (embeddings.empty() || dim == 0) {
+        return pooled;
+    }
+    for (const auto& embedding : embeddings) {
+        for (size_t i = 0; i < std::min(dim, embedding.size()); ++i) {
+            const double delta = embedding[i] - mean[i];
+            pooled[i] += delta * delta;
+        }
+    }
+    const double scale = 1.0 / static_cast<double>(embeddings.size());
+    for (double& value : pooled) {
+        value *= scale;
+    }
+    return pooled;
+}
+
+void appendVector(std::vector<double>* dst, const std::vector<double>& src) {
+    dst->insert(dst->end(), src.begin(), src.end());
 }
 
 }  // namespace
@@ -416,12 +614,19 @@ JepaTrainingArtifacts trainMinimalModel(const std::vector<JepaLatentSample>& sam
     }
 
     std::vector<TrainingExample> examples;
-    if (config.targetMode == TargetMode::TemporalFixation) {
-        examples = buildTemporalExamples(samples, summary.projectionDim);
+    const bool requiresTemporalExamples =
+        config.targetMode == TargetMode::TemporalFixation ||
+        config.targetMode == TargetMode::TemporalHemisphereSummary;
+    if (requiresTemporalExamples) {
+        examples = buildTemporalExamples(samples, summary.projectionDim, config);
         summary.temporalExampleCount = examples.size();
     }
+    if (requiresTemporalExamples && examples.empty()) {
+        throw std::runtime_error(
+            "JEPA temporal target mode requested, but no temporal examples were built");
+    }
     if (examples.empty()) {
-        examples = buildMaskedExamples(samples, summary.projectionDim);
+        examples = buildMaskedExamples(samples, summary.projectionDim, config);
         summary.fallbackMaskedExampleCount = examples.size();
     }
     summary.trainingExampleCount = examples.size();
@@ -438,36 +643,69 @@ JepaTrainingArtifacts trainMinimalModel(const std::vector<JepaLatentSample>& sam
     const double lr = std::max(0.0, config.trainerLearningRate);
     const double weightDecay = std::max(0.0, config.trainerWeightDecay);
     const double emaDecay = std::clamp(config.targetEmaDecay, 0.0, 0.999999);
+    const double mseWeight = std::max(0.0, config.mseLossWeight);
+    const double cosineWeight = std::max(0.0, config.cosineLossWeight);
+    const double variancePenalty = std::max(0.0, config.variancePenalty);
+    const double varianceFloor = std::max(0.0, config.varianceFloor);
     const double gradientScale = 2.0 / static_cast<double>(std::max<size_t>(1, dim));
 
     for (int epoch = 0; epoch < summary.epochCount; ++epoch) {
-        for (const auto& example : examples) {
-            const auto contextLatent = applyLinear(contextEncoder, example.visible);
-            const auto prediction = applyLinear(predictor, contextLatent);
-            const auto targetLatent = applyLinear(targetEncoder, example.target);
+        std::vector<std::vector<double>> contextLatents(examples.size());
+        std::vector<std::vector<double>> predictions(examples.size());
+        std::vector<std::vector<double>> targetLatents(examples.size());
+        for (size_t index = 0; index < examples.size(); ++index) {
+            contextLatents[index] = applyLinear(contextEncoder, examples[index].visible);
+            predictions[index] = applyLinear(predictor, contextLatents[index]);
+            targetLatents[index] = applyLinear(targetEncoder, examples[index].target);
+        }
 
+        const auto predictionMoments = computeBatchMoments(predictions);
+        auto predictorGradients = makeZeroGradients(dim);
+        auto contextEncoderGradients = makeZeroGradients(dim);
+        const double batchScale = 1.0 / static_cast<double>(std::max<size_t>(1, examples.size()));
+
+        for (size_t index = 0; index < examples.size(); ++index) {
             std::vector<double> predictionGradient(dim, 0.0);
             for (size_t i = 0; i < dim; ++i) {
-                predictionGradient[i] = gradientScale * (prediction[i] - targetLatent[i]);
+                predictionGradient[i] +=
+                    mseWeight * gradientScale * (predictions[index][i] - targetLatents[index][i]);
             }
 
-            auto predictorGradients = makeZeroGradients(dim);
+            if (cosineWeight > 0.0) {
+                const auto cosineGrad = cosineGradient(predictions[index], targetLatents[index]);
+                for (size_t i = 0; i < dim; ++i) {
+                    predictionGradient[i] += cosineWeight * cosineGrad[i];
+                }
+            }
+
+            if (!predictionMoments.variance.empty()) {
+                for (size_t i = 0; i < dim; ++i) {
+                    if (predictionMoments.variance[i] < varianceFloor) {
+                        predictionGradient[i] -=
+                            variancePenalty * 2.0 * batchScale *
+                            (predictions[index][i] - predictionMoments.mean[i]);
+                    }
+                }
+            }
+
+            for (double& value : predictionGradient) {
+                value *= batchScale;
+            }
+
             const auto contextGradient =
                 accumulateLinearGradients(predictor,
-                                          contextLatent,
+                                          contextLatents[index],
                                           predictionGradient,
                                           &predictorGradients);
-
-            auto contextEncoderGradients = makeZeroGradients(dim);
             accumulateLinearGradients(contextEncoder,
-                                      example.visible,
+                                      examples[index].visible,
                                       contextGradient,
                                       &contextEncoderGradients);
-
-            applyGradients(&predictor, predictorGradients, lr, weightDecay);
-            applyGradients(&contextEncoder, contextEncoderGradients, lr, weightDecay);
-            updateEma(&targetEncoder, contextEncoder, emaDecay);
         }
+
+        applyGradients(&predictor, predictorGradients, lr, weightDecay);
+        applyGradients(&contextEncoder, contextEncoderGradients, lr, weightDecay);
+        updateEma(&targetEncoder, contextEncoder, emaDecay);
     }
 
     std::vector<std::vector<double>> visibleEmbeddings;
@@ -489,10 +727,12 @@ JepaTrainingArtifacts trainMinimalModel(const std::vector<JepaLatentSample>& sam
         const auto& shuffledExample = examples[(index + 1) % examples.size()];
         const auto shuffledTargetLatent = applyLinear(targetEncoder, shuffledExample.target);
 
-        totalLoss += 0.5 * normalizedMse(prediction, targetLatent) +
-                     0.5 * cosineDistance(prediction, targetLatent);
-        totalShuffledLoss += 0.5 * normalizedMse(prediction, shuffledTargetLatent) +
-                             0.5 * cosineDistance(prediction, shuffledTargetLatent);
+        totalLoss +=
+            (mseWeight * meanSquaredError(prediction, targetLatent)) +
+            (cosineWeight * cosineDistance(prediction, targetLatent));
+        totalShuffledLoss +=
+            (mseWeight * meanSquaredError(prediction, shuffledTargetLatent)) +
+            (cosineWeight * cosineDistance(prediction, shuffledTargetLatent));
 
         visibleEmbeddings.push_back(example.visible);
         contextEmbeddings.push_back(contextLatent);
@@ -506,6 +746,7 @@ JepaTrainingArtifacts trainMinimalModel(const std::vector<JepaLatentSample>& sam
     summary.meanContextNorm = meanNorm(contextEmbeddings);
     summary.meanTargetNorm = meanNorm(targetEmbeddings);
     summary.meanPredictionNorm = meanNorm(predictionEmbeddings);
+    summary.contextVariance = meanEmbeddingVariance(contextEmbeddings);
     summary.targetVariance = meanEmbeddingVariance(targetEmbeddings);
     summary.predictionVariance = meanEmbeddingVariance(predictionEmbeddings);
     summary.meanVariancePenalty = std::max(0.0, config.varianceFloor - summary.predictionVariance) *
@@ -527,6 +768,8 @@ JepaTrainingArtifacts trainMinimalModel(const std::vector<JepaLatentSample>& sam
     }
 
     artifacts.model.projectionDim = dim;
+    artifacts.model.encodeViewMetadata = config.encodeViewMetadata;
+    artifacts.model.metadataScale = config.metadataScale;
     artifacts.model.contextEncoder = std::move(contextEncoder);
     artifacts.model.predictor = std::move(predictor);
     artifacts.model.targetEncoder = std::move(targetEncoder);
@@ -547,14 +790,81 @@ std::vector<double> encodeSample(const JepaLatentSample& sample,
     }
 
     const auto views = sortViews(sample);
-    std::vector<double> embedding;
-    embedding.reserve(views.size() * model.projectionDim);
+    const size_t directProjectionDim = std::max<size_t>(256U, model.projectionDim * 8U);
+    std::vector<std::vector<double>> directViews;
+    std::vector<std::vector<double>> encodedViews;
+    encodedViews.reserve(views.size());
+    directViews.reserve(views.size());
+    std::unordered_map<std::string, std::vector<std::vector<double>>> directByHemisphere;
+    std::unordered_map<std::string, std::vector<std::vector<double>>> byHemisphere;
+    std::unordered_map<size_t, std::vector<std::vector<double>>> directByFixation;
+    std::unordered_map<size_t, std::vector<std::vector<double>>> byFixation;
     for (const auto* view : views) {
+        auto directProjection = !view->branchTokens.empty()
+            ? projectTokens(view->branchTokens, directProjectionDim)
+            : projectVector(view->hemisphereToken, directProjectionDim);
         auto projection = !view->branchTokens.empty()
             ? projectTokens(view->branchTokens, model.projectionDim)
             : projectVector(view->hemisphereToken, model.projectionDim);
+        if (model.encodeViewMetadata) {
+            addInPlace(&directProjection,
+                       projectMetadata(view->hemisphereName,
+                                       view->surfaceName,
+                                       view->sourceViewIndex,
+                                       directProjectionDim,
+                                       model.metadataScale));
+            addInPlace(&projection,
+                       projectMetadata(view->hemisphereName,
+                                       view->surfaceName,
+                                       view->sourceViewIndex,
+                                       model.projectionDim,
+                                       model.metadataScale));
+        }
+        directViews.push_back(directProjection);
+        directByHemisphere[view->hemisphereName].push_back(directProjection);
+        directByFixation[view->sourceViewIndex].push_back(directProjection);
         auto encoded = applyLinear(model.contextEncoder, projection);
-        embedding.insert(embedding.end(), encoded.begin(), encoded.end());
+        encodedViews.push_back(encoded);
+        byHemisphere[view->hemisphereName].push_back(encoded);
+        byFixation[view->sourceViewIndex].push_back(std::move(encoded));
+    }
+
+    if (encodedViews.empty()) {
+        return {};
+    }
+
+    std::vector<double> embedding;
+    embedding.reserve((directProjectionDim * 8U) + (model.projectionDim * 8U));
+
+    const auto globalMean = meanPool(encodedViews, model.projectionDim);
+    const auto globalVar = variancePool(encodedViews, globalMean, model.projectionDim);
+    const auto directGlobalMean = meanPool(directViews, directProjectionDim);
+    const auto directGlobalVar = variancePool(directViews, directGlobalMean, directProjectionDim);
+    appendVector(&embedding, directGlobalMean);
+    appendVector(&embedding, directGlobalVar);
+    appendVector(&embedding, globalMean);
+    appendVector(&embedding, globalVar);
+
+    std::vector<std::string> hemisphereNames;
+    hemisphereNames.reserve(byHemisphere.size());
+    for (const auto& entry : byHemisphere) {
+        hemisphereNames.push_back(entry.first);
+    }
+    std::sort(hemisphereNames.begin(), hemisphereNames.end());
+    for (const auto& name : hemisphereNames) {
+        appendVector(&embedding, meanPool(directByHemisphere[name], directProjectionDim));
+        appendVector(&embedding, meanPool(byHemisphere[name], model.projectionDim));
+    }
+
+    std::vector<size_t> fixationIndices;
+    fixationIndices.reserve(byFixation.size());
+    for (const auto& entry : byFixation) {
+        fixationIndices.push_back(entry.first);
+    }
+    std::sort(fixationIndices.begin(), fixationIndices.end());
+    for (size_t fixationIndex : fixationIndices) {
+        appendVector(&embedding, meanPool(directByFixation[fixationIndex], directProjectionDim));
+        appendVector(&embedding, meanPool(byFixation[fixationIndex], model.projectionDim));
     }
     return embedding;
 }

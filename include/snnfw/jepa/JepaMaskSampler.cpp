@@ -65,6 +65,12 @@ JepaMaskedView buildMaskedView(const JepaHemisphereView& view,
         totalBranches - hiddenCount,
         static_cast<size_t>(std::max(0, config.visibleBranchCount)));
 
+    // Promoted classifier-side surfaces may collapse branch structure into a single token.
+    // Leave masking empty in that case so temporal JEPA can still fall back to the full view.
+    if (hiddenCount == 0 || visibleCount == 0) {
+        return maskedView;
+    }
+
     maskedView.hiddenBranchIndices = sampleIndices(totalBranches, hiddenCount, rng);
 
     std::vector<size_t> remaining;

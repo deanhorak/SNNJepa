@@ -15,6 +15,8 @@ struct JepaLinearLayer {
 
 struct JepaModel {
     size_t projectionDim = 0;
+    bool encodeViewMetadata = true;
+    double metadataScale = 0.2;
     JepaLinearLayer contextEncoder;
     JepaLinearLayer predictor;
     JepaLinearLayer targetEncoder;
@@ -35,6 +37,7 @@ struct JepaTrainingSummary {
     double meanContextNorm = 0.0;
     double meanTargetNorm = 0.0;
     double meanPredictionNorm = 0.0;
+    double contextVariance = 0.0;
     double targetVariance = 0.0;
     double predictionVariance = 0.0;
     double contextEncoderWeightNorm = 0.0;
