@@ -18,7 +18,8 @@ enum class MaskMode {
 enum class TargetMode {
     BranchMask,
     TemporalFixation,
-    TemporalHemisphereSummary
+    TemporalHemisphereSummary,
+    TemporalSpikeCode
 };
 
 struct JepaConfig {
@@ -30,6 +31,7 @@ struct JepaConfig {
     int maxSamples = 128;
     bool includeBranchTokens = true;
     bool includeHemisphereToken = true;
+    int branchSubregionCount = 4;
     MaskMode maskMode = MaskMode::Branch;
     TargetMode targetMode = TargetMode::TemporalFixation;
     int visibleBranchCount = 1;
@@ -45,11 +47,17 @@ struct JepaConfig {
     double targetEmaDecay = 0.99;
     double varianceFloor = 0.02;
     double variancePenalty = 0.25;
+    double covariancePenalty = 0.05;
+    double successorDiscount = 0.6;
+    int temporalSpikeCodeDim = 32768;
     double mseLossWeight = 1.0;
     double cosineLossWeight = 1.0;
     bool encodeViewMetadata = true;
     double metadataScale = 0.2;
     std::string probeMode = "knn";
+    std::string probeClassifier = "majority";
+    int probeK = 1;
+    double probeExponent = 1.0;
     int probeHiddenDim = 64;
     int probeEpochs = 30;
     double probeLearningRate = 0.05;
@@ -83,6 +91,8 @@ inline const char* targetModeName(TargetMode mode) {
             return "temporal_fixation";
         case TargetMode::TemporalHemisphereSummary:
             return "temporal_hemisphere_summary";
+        case TargetMode::TemporalSpikeCode:
+            return "temporal_spike_code";
     }
     return "temporal_fixation";
 }

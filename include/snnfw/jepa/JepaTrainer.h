@@ -15,6 +15,11 @@ struct JepaLinearLayer {
 
 struct JepaModel {
     size_t projectionDim = 0;
+    size_t contextInputDim = 0;
+    size_t targetInputDim = 0;
+    bool futureSummaryAligned = false;
+    bool temporalSpikeCodeAligned = false;
+    size_t temporalSpikeCodeDim = 0;
     bool encodeViewMetadata = true;
     double metadataScale = 0.2;
     JepaLinearLayer contextEncoder;
@@ -33,6 +38,7 @@ struct JepaTrainingSummary {
     double meanLoss = 0.0;
     double meanShuffledLoss = 0.0;
     double meanVariancePenalty = 0.0;
+    double meanCovariancePenalty = 0.0;
     double meanVisibleNorm = 0.0;
     double meanContextNorm = 0.0;
     double meanTargetNorm = 0.0;
@@ -50,6 +56,12 @@ struct JepaTrainingArtifacts {
     JepaTrainingSummary summary;
 };
 
+struct JepaPredictionError {
+    bool available = false;
+    double cosine = 0.0;
+    double error = 0.0;
+};
+
 JepaTrainingArtifacts trainMinimalModel(
     const std::vector<JepaLatentSample>& samples,
     const JepaConfig& config,
@@ -61,6 +73,10 @@ JepaTrainingSummary runMinimalTrainer(
     const std::string& outputPath);
 
 std::vector<double> encodeSample(
+    const JepaLatentSample& sample,
+    const JepaModel& model);
+
+JepaPredictionError evaluateTemporalPredictionError(
     const JepaLatentSample& sample,
     const JepaModel& model);
 

@@ -12,7 +12,8 @@ namespace {
 
 using json = nlohmann::json;
 
-std::vector<JepaLatentToken> buildBranchTokens(const Stage1TapInput& tap) {
+std::vector<JepaLatentToken> buildBranchTokens(const Stage1TapInput& tap,
+                                               const JepaConfig& config) {
     std::vector<JepaLatentToken> tokens;
     if (tap.pattern.empty()) {
         return tokens;
@@ -29,19 +30,35 @@ std::vector<JepaLatentToken> buildBranchTokens(const Stage1TapInput& tap) {
             break;
         }
 
-        JepaLatentToken token;
-        token.name = "branch_" + std::to_string(branchIndex);
-        token.offset = offset;
-        token.size = end - offset;
-        token.values.assign(tap.pattern.begin() + static_cast<std::ptrdiff_t>(offset),
-                            tap.pattern.begin() + static_cast<std::ptrdiff_t>(end));
-        tokens.push_back(std::move(token));
+        const size_t branchOffset = offset;
+        const size_t branchTokenSize = end - offset;
+        const size_t subregionCount = std::min(
+            branchTokenSize,
+            static_cast<size_t>(std::max(1, config.branchSubregionCount)));
+        for (size_t subregionIndex = 0; subregionIndex < subregionCount; ++subregionIndex) {
+            const size_t localStart = (subregionIndex * branchTokenSize) / subregionCount;
+            const size_t localEnd =
+                ((subregionIndex + 1) * branchTokenSize) / subregionCount;
+            if (localEnd <= localStart) {
+                continue;
+            }
+
+            JepaLatentToken token;
+            token.name = "branch_" + std::to_string(branchIndex) +
+                         "_subregion_" + std::to_string(subregionIndex);
+            token.offset = branchOffset + localStart;
+            token.size = localEnd - localStart;
+            token.values.assign(
+                tap.pattern.begin() + static_cast<std::ptrdiff_t>(token.offset),
+                tap.pattern.begin() + static_cast<std::ptrdiff_t>(token.offset + token.size));
+            tokens.push_back(std::move(token));
+        }
         offset = end;
     }
 
     if (tokens.empty()) {
         JepaLatentToken token;
-        token.name = "branch_0";
+        token.name = "branch_0_subregion_0";
         token.offset = 0;
         token.size = tap.pattern.size();
         token.values = tap.pattern;
@@ -124,7 +141,7 @@ std::vector<JepaLatentSample> buildStage1LatentSamples(
         view.surfaceName = tap.surfaceName;
         view.sourceViewIndex = tap.sourceViewIndex;
         if (config.includeBranchTokens) {
-            view.branchTokens = buildBranchTokens(tap);
+            view.branchTokens = buildBranchTokens(tap, config);
         }
         if (config.includeHemisphereToken) {
             view.hemisphereToken = tap.pattern;

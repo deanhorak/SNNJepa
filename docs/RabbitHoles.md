@@ -239,6 +239,114 @@ Why it was not productive:
 - the classifier collapsed toward a new wrong basin instead of improving (`ship` became dominant on the all-branch edge revival run)
 - this showed that a globally revived coarse edge path can overpower the appearance path rather than complement it
 
+### 12. Treating CIFAR Promoted JEPA Surfaces As The Missing Fix
+
+What we tried:
+
+- figure-ground-mask promoted temporal JEPA surface
+- recurrent promoted temporal JEPA surface
+- explicit topographic promoted surface
+- explicit convergent promoted surface
+
+Why it was not productive:
+
+- the default bounded CIFAR configs were initially naming `promoted_stage1` without any real promotion stage enabled, so the surface simply aliased `raw_stage1`
+- after that semantic issue was fixed, the real promoted surfaces still did not improve CIFAR JEPA enough to keep
+- topographic promotion changed dimensionality but not end-to-end accuracy enough to matter
+- convergent promotion slightly improved direct nearest-neighbor audit numbers while hurting actual JEPA probe accuracy badly
+
+Measured outcomes:
+
+- figure-ground-mask promoted smoke: baseline `31.00% (62/200)`, JEPA probe `15.00% (30/200)`
+- recurrent promoted smoke: baseline `29.00% (58/200)`, JEPA probe `15.00% (30/200)`
+- topographic promoted smoke: baseline `23.00% (23/100)`, JEPA probe `21.00% (21/100)`
+- convergent promoted smoke: baseline `23.00% (23/100)`, JEPA probe `13.00% (13/100)`
+
+Lesson:
+
+- do not spend more CIFAR JEPA time on promoted-surface swaps unless there is a new representation hypothesis with evidence that the promoted surface carries stronger class signal than raw
+
+### 13. Adding More Frozen JEPA Embedding Features Without A Transfer Check
+
+What we tried:
+
+- richer structured embedding with predictor-pooled features, per-group variances, and temporal deltas
+- direct temporal-stat append after the wide-direct residual fix
+- predictor-summary append
+- predictor-informed blend
+- adaptive direct/JEPA mixer
+- block normalization of pooled embedding segments
+
+Why it was not productive:
+
+- several variants improved a small audit or smoke gate while failing to improve the actual bounded CIFAR probe
+- some additions increased runtime or dimensionality without preserving more class signal
+- the main confirmed win was the wide direct residual itself; most follow-on feature additions diluted that gain instead of extending it
+
+Measured outcomes:
+
+- structured embedding rerun stayed about `18.00%`
+- temporal-stat bounded fixation rerun fell to `22.60% (113/500)` from the better wide-direct line
+- predictor append and predictor blend stayed at `15.00% (15/100)` on the smoke gate
+- adaptive mixer reached `17.00%`, not better than the plain wide-direct residual path
+- block normalization dropped the corrected-readout smoke to `21.00%`
+
+Lesson:
+
+- do not keep adding frozen summary blocks to the JEPA embedding unless the gain survives the real bounded CIFAR gate, not just the audit or a small smoke
+
+### 14. Assuming The JEPA Probe Should Match The Representation Audit Readout
+
+What we tried:
+
+- decoupling the JEPA probe from the main classifier and defaulting CIFAR JEPA evaluation to `majority, k=1` because it matched the audit’s `1-NN` view
+
+Why it was not productive as a default:
+
+- the change was reasonable, but the blanket assumption was wrong
+- on the current wide-direct CIFAR embedding, the archived JEPA readout semantics still perform better than the `k=1` probe
+
+Measured outcomes:
+
+- current explicit raw-stage smoke:
+  - `majority, k=1`: `22.00% (22/100)`
+  - `weighted_distance, k=9`: `24.00% (24/100)`
+- bounded `100/500` reruns with archived semantics:
+  - temporal fixation: baseline `30.40% (152/500)`, JEPA probe `23.40% (117/500)`
+  - temporal hemisphere summary: baseline `30.40% (152/500)`, JEPA probe `23.40% (117/500)`
+
+Lesson:
+
+- do not assume the JEPA probe readout that best matches an audit metric is the one that best measures the usable CIFAR embedding
+- keep JEPA probe configuration decoupled, but choose it empirically on the real bounded gate
+
+### 15. Forcing Temporal CIFAR JEPA Into History-To-Future-Summary MLP Prediction
+
+What we tried:
+
+- disabled branch masking for temporal CIFAR JEPA
+- used full fixation-history context instead of masked single-branch context
+- switched temporal prediction to future pooled hemisphere summaries
+- replaced the linear JEPA branch with a small normalized MLP plus covariance regularization
+
+Why it was not productive:
+
+- the trainer metrics looked cleaner, but the learned representation got worse on the actual CIFAR probe
+- this means the objective became easier to optimize numerically without preserving more class-relevant signal
+- in practice it moved further away from the best known CIFAR JEPA line instead of closer to it
+
+Measured outcomes:
+
+- smoke `20/class, 200 test`: baseline `32.00%`, JEPA probe `16.50%`
+- bounded `100/500` fixation: baseline `30.40% (152/500)`, JEPA probe `19.00% (95/500)`
+- bounded `100/500` hemisphere summary: baseline `30.40% (152/500)`, JEPA probe `19.00% (95/500)`
+- reference line it failed to beat: `23.40% (117/500)` under the restored wide-direct path and archived `weighted_distance, k=9` probe semantics
+
+Lesson:
+
+- do not assume a more JEPA-like temporal objective is automatically better for this SNN substrate
+- improved trainer separation metrics are not enough; if the bounded CIFAR probe drops, revert immediately
+
 Lesson:
 
 - do not turn on coarse normalized edge analysis everywhere at once
@@ -1859,3 +1967,34 @@ For current vision work:
 - use the bilateral Retina static and continuous paths as the mainline benchmark
 - use the CIFAR natural-features path as the current natural-image reference, not as proof that the edge path is solved
 - treat graph-native cortical vision as experimental research, not the default execution path
+
+## JEPA Rabbit Holes
+
+These paths looked promising enough to try, but they did not move CIFAR forward and should not be retried in the same form.
+
+### Successor-Summary VICReg-JEPA at default CIFAR scale
+
+What was tried:
+
+- kept the locked Stage 0-5 CIFAR contract
+- replaced the single future-summary target with a discounted successor-style future-summary target
+- added VICReg-style variance and covariance penalties to both context and prediction latents
+- evaluated on the existing CIFAR temporal fixation smoke gate
+
+Why it is a dead end in this exact form:
+
+- the first smoke landed at only `15.50% (31/200)` JEPA probe vs `31.00% (62/200)` baseline
+- trainer dump still showed near-collapse:
+  - `context_variance = 2.73e-06`
+  - `prediction_variance = 6.56e-07`
+  - `target_variance = 2.94e-06`
+- the covariance term was effectively inactive at this scale:
+  - `mean_covariance_penalty = 3.09e-13`
+- shuffled loss stayed too close to true-target loss:
+  - `0.00179` vs `0.00173`
+
+Lesson:
+
+- the idea is still architecturally relevant, but the default CIFAR `32d / 20 epoch` setting is too collapsed for this branch to pay off
+- do not spend more time on this exact low-capacity successor/VICReg setup
+- if this branch is revisited, it must be with materially stronger latent scale or stabilization, not cosmetic retuning

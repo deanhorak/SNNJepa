@@ -264,6 +264,29 @@ This means the next real gains are more likely to come from **representation-sta
 
 Keep the existing Retina and CIFAR references stable.
 
+### Next Milestone
+
+The next milestone is:
+
+**Temporal spike-code representation audit**
+
+This should happen before another JEPA trainer sweep.
+
+The audit should measure whether the actual temporal spiking code is improving, not whether a sidecar JEPA probe can be tuned upward. For CIFAR this means evaluating spike timing, fixation order, trace dynamics, coincidence structure, and branch/hemisphere separability before changing the JEPA trainer again.
+
+Required audit surfaces:
+
+- temporal branch/subregion spike traces
+- first-spike or rank-order evidence
+- temporally discounted eligibility traces
+- fixation-to-fixation stability and separation
+- branch and hemisphere class separability from temporal code alone
+
+Promotion rule:
+
+- do not plug a new predictive objective into the pipeline until the temporal spike-code audit shows a better code than the current raw/recurrent direct surfaces
+- the current rich projected temporal code improves the direct temporal probe from `17%` to `21%` on CIFAR `10/class`, `100` test, but the audit still holds because best temporal nearest-neighbor is `21%` versus `22%` for the reference direct surface; keep it as the predictor target, not as a classifier vote
+
 ### Research Posture
 
 Only pursue experiments that satisfy this principle:
@@ -288,6 +311,8 @@ Based on the rabbit-hole history, the most defensible future work is likely in o
 
 Not another scalar retune of the current map, but a new code family that plausibly changes separability.
 
+Current blocker: the CIFAR adapter path still reports `encoding=rate`, and the first-spike-rank probe collapses to `10%` on the larger smoke. The next useful implementation should replace or bypass this upstream rate-coded adapter behavior with real latency/event timing before more JEPA tuning.
+
 ### 2. A Real Intermediate Representation Boundary
 
 Not classifier-side concatenation or masking, but a distinct boundary that can preserve structure and support object-level organization.
@@ -295,6 +320,13 @@ Not classifier-side concatenation or masking, but a distinct boundary that can p
 ### 3. Predictive Or Recurrent Mechanisms At The Right Level
 
 Not decision-path centroid suppression, but mechanisms operating where actual-minus-expected structure can reshape representation.
+
+For the next pass, this means JEPA-style prediction should be used as a biologically plausible learning signal after the temporal spike-code audit identifies a stronger code:
+
+- context: past temporal spike traces across fixations and hemispheres
+- target: future temporal trace summary, not a rate-coded static vector
+- signal: prediction error that gates local plasticity or eligibility updates
+- output: improved temporal code measured by the audit, not a standalone JEPA probe win
 
 ### 4. Changes That Preserve Topology While Improving Object-Level Organization
 
@@ -326,13 +358,15 @@ For every new path:
 
 1. verify propagation and activity
 
-2. measure stage-wise separability
+2. run the temporal spike-code representation audit
 
-3. compare against the protected baseline
+3. measure stage-wise separability
 
-4. confirm any narrow win
+4. compare against the protected baseline
 
-5. promote only after real benchmark evidence
+5. confirm any narrow win
+
+6. promote only after real benchmark evidence
 
 If the path fails at stage-wise separability, stop early.
 
@@ -347,6 +381,8 @@ For current `SNNJepa` vision work, the default should be:
 - stop revisiting known dead ends through minor retunes
 
 - bias new work toward representation quality
+
+- make temporal spike-code quality the next milestone
 
 - require stage-wise evidence before decision/readout tuning
 

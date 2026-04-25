@@ -24,6 +24,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
 #include <random>
 #include <numeric>
@@ -107,6 +108,9 @@ struct Config {
     double corpusCentroidGain = 0.0;
     double corpusNeighborGain = 0.0;
     double corpusDisagreementGain = 0.0;
+    bool corpusDisagreementArbiterEnabled = false;
+    double corpusDisagreementArbiterMinMargin = 0.04;
+    double corpusDisagreementArbiterMarginDelta = 0.06;
     bool hemisphereConvergentCodeEnabled = false;
     int hemisphereConvergentSummaryBins = 12;
     double hemisphereConvergentResidualGain = 0.35;
@@ -150,6 +154,15 @@ struct Config {
     double predictionErrorFeedbackThreshold = 0.20;
     double predictionErrorFeedbackMaxPenalty = 0.18;
     double predictionErrorFeedbackMinConfidence = 0.05;
+    bool temporalSpikePredictionErrorFeedbackEnabled = false;
+    double temporalSpikePredictionErrorFeedbackGain = 0.15;
+    double temporalSpikePredictionErrorFeedbackThreshold = 0.35;
+    double temporalSpikePredictionErrorFeedbackMaxPenalty = 0.20;
+    double temporalSpikePredictionErrorPlasticityGain = 0.50;
+    bool temporalSpikePredictionErrorReplayOnlyEnabled = false;
+    double temporalSpikePredictionErrorReplayGain = 1.0;
+    double temporalSpikePredictionErrorReplayThreshold = 0.226;
+    double temporalSpikePredictionErrorReplayUncertaintyThreshold = 0.35;
     int onlineCorrectionRepeats = 0;
     int onlineExemplarBudgetPerClass = 16;
     double onlineCentroidLr = 0.25;
@@ -229,12 +242,22 @@ struct Config {
     int flowAuditSampleLimit = 0;
     std::string flowAuditOutputPrefix;
     bool jepaRepresentationAuditEnabled = false;
+    bool temporalSpikeCodeAuditEnabled = false;
+    bool temporalSpikeCodeProbeEnabled = false;
+    std::string temporalSpikeCodeProbeType = "temporal_onset_sustained_projected";
     int jepaRepresentationAuditSampleLimit = 0;
     std::string jepaRepresentationAuditOutputPath;
     JepaConfig jepa;
 };
 
 struct JepaProbeResult {
+    IntMatrix confusion;
+    int correct = 0;
+    int tested = 0;
+    double seconds = 0.0;
+};
+
+struct TemporalSpikeCodeProbeResult {
     IntMatrix confusion;
     int correct = 0;
     int tested = 0;
@@ -255,6 +278,21 @@ struct TemporalConsistencySummary {
     int groupedSequenceCount = 0;
 };
 
+struct TokenizationAuditSummary {
+    std::string family;
+    std::string schema;
+    int configuredSubregionsPerBranch = 0;
+    size_t sampleCount = 0;
+    size_t viewCount = 0;
+    double meanTokensPerView = 0.0;
+    double meanTokensPerHemisphere = 0.0;
+    double meanTokenSize = 0.0;
+    double meanTokenNonzeroFraction = 0.0;
+    double meanTokenL2Energy = 0.0;
+    std::vector<std::string> tokenNames;
+    std::vector<size_t> tokenSizes;
+};
+
 struct RepresentationAuditMetrics {
     std::string name;
     std::string surface;
@@ -273,8 +311,59 @@ struct RepresentationAuditMetrics {
     TemporalConsistencySummary testConsistency;
 };
 
+struct ContextAgreementSummary {
+    std::string name;
+    size_t sampleCount = 0;
+    size_t contextDim = 0;
+    size_t targetDim = 0;
+    double sameImageMeanCosine = 0.0;
+    double shuffledMeanCosine = 0.0;
+    double agreementMargin = 0.0;
+    bool available = false;
+    std::string note;
+};
+
+struct TemporalSpikeCodeAuditMetrics {
+    std::string name;
+    std::string codeType;
+    RepresentationAuditMetrics separability;
+    bool available = false;
+    std::string note;
+    double meanActiveFraction = 0.0;
+    double meanFirstSpikePosition = 0.0;
+    double meanTimingSpread = 0.0;
+    double meanAdjacentDeltaNorm = 0.0;
+    double meanTraceNorm = 0.0;
+};
+
+struct TemporalSpikeCodeAuditReport {
+    bool enabled = false;
+    bool gatePassed = false;
+    double referenceAccuracy = 0.0;
+    double bestTemporalAccuracy = 0.0;
+    std::string decision;
+    std::vector<TemporalSpikeCodeAuditMetrics> metrics;
+};
+
+struct PreTrainerReviewGate {
+    bool stage1Complete = false;
+    bool stage2Complete = false;
+    bool stage3Complete = false;
+    bool stage4Complete = false;
+    bool goForTrainerRedesign = false;
+    std::string tokenization;
+    std::string targetSurface;
+    std::string contextDefinition;
+    std::string futureProbeEmbedding;
+    std::string decision;
+};
+
 struct RepresentationAuditReport {
+    TokenizationAuditSummary tokenization;
     std::vector<RepresentationAuditMetrics> metrics;
+    std::vector<ContextAgreementSummary> contextAudits;
+    TemporalSpikeCodeAuditReport temporalSpikeCodeAudit;
+    PreTrainerReviewGate reviewGate;
     std::string outputPath;
 };
 
@@ -388,12 +477,20 @@ struct BilateralDecisionTrace {
     int predicted = -1;
     int fixationCount = 1;
     std::vector<std::pair<double, double>> fixationShifts;
+    bool corpusDisagreementArbiterUsed = false;
+    int corpusDisagreementArbiterOriginalPredicted = -1;
+    int corpusDisagreementArbiterSelectedHemisphere = -1;
+    bool temporalSpikePredictionErrorAvailable = false;
+    double temporalSpikePredictionError = 0.0;
+    double temporalSpikePredictionCosine = 0.0;
 };
 
 struct DecisionContext {
     double uncertainty = 0.0;
     double disagreement = 0.0;
     double confusionCluster = 0.0;
+    double temporalSpikePredictionError = 0.0;
+    double temporalSpikePredictionReplayBoost = 0.0;
     double plasticity = 1.0;
     double replayPriority = 0.0;
 };
@@ -462,6 +559,10 @@ struct TrainingSchedulePlan {
 std::vector<double> buildFusionPattern(std::vector<HemisphereRuntime>& hemispheres,
                                        const VisualStimulus& image,
                                        const Config& config);
+std::vector<double> buildConfidenceConcatPatternFromTraces(
+    const std::vector<HemisphereDecisionTrace>& traces);
+std::vector<double> buildHemisphereConcatPatternFromTraces(
+    const std::vector<HemisphereDecisionTrace>& traces);
 struct FixationSpec;
 struct HemispherePatternAccumulator;
 struct ContextualGroupingLayout;
@@ -486,6 +587,8 @@ bool useFigureGroundObjectMemory(const Config& config);
 bool useRecurrentSensoryState(const Config& config);
 bool useRecurrentPopulationReadout(const Config& config);
 bool useRecurrentObjectStateReadout(const Config& config);
+bool hasClassifierSidePromotionStage(const Config& config);
+bool promotedTapSurfaceAliasesRawStage1(const Config& config);
 std::vector<double> computeHemisphereReadoutConfidence(
     const HemisphereRuntime& hemisphere,
     const std::vector<double>& pattern,
@@ -1148,12 +1251,22 @@ std::string defaultJepaRepresentationAuditOutputPath(const Config& config) {
     }
 
     std::filesystem::path baseDir("build");
-    std::string stem = "jepa_representation_audit";
+    std::string stem = config.temporalSpikeCodeAuditEnabled &&
+                               !config.jepaRepresentationAuditEnabled
+                           ? "temporal_spike_code_audit"
+                           : "jepa_representation_audit";
     if (!config.configPath.empty()) {
         stem = std::filesystem::path(config.configPath).stem().string() +
-               "_jepa_representation_audit";
+               (config.temporalSpikeCodeAuditEnabled &&
+                        !config.jepaRepresentationAuditEnabled
+                    ? "_temporal_spike_code_audit"
+                    : "_jepa_representation_audit");
     } else if (!config.inputDomain.empty()) {
-        stem = config.inputDomain + "_" + config.inputVariant + "_jepa_representation_audit";
+        stem = config.inputDomain + "_" + config.inputVariant +
+               (config.temporalSpikeCodeAuditEnabled &&
+                        !config.jepaRepresentationAuditEnabled
+                    ? "_temporal_spike_code_audit"
+                    : "_jepa_representation_audit");
     }
     stem = sanitizeFlowAuditStem(stem);
     return (baseDir / (stem + ".json")).string();
@@ -1196,6 +1309,696 @@ std::vector<double> meanPoolDenseVectors(const std::vector<std::vector<double>>&
         entry *= scale;
     }
     return pooled;
+}
+
+std::vector<double> flattenJepaBranchTokens(const snnfw::jepa::JepaHemisphereView& view) {
+    std::vector<double> values;
+    for (const auto& token : view.branchTokens) {
+        values.insert(values.end(), token.values.begin(), token.values.end());
+    }
+    return values;
+}
+
+std::vector<const snnfw::jepa::JepaHemisphereView*> sortedJepaViewsByTime(
+    const snnfw::jepa::JepaLatentSample& sample) {
+    std::vector<const snnfw::jepa::JepaHemisphereView*> views;
+    views.reserve(sample.hemisphereViews.size());
+    for (const auto& view : sample.hemisphereViews) {
+        views.push_back(&view);
+    }
+    std::sort(views.begin(), views.end(),
+              [](const snnfw::jepa::JepaHemisphereView* lhs,
+                 const snnfw::jepa::JepaHemisphereView* rhs) {
+                  if (lhs->hemisphereName != rhs->hemisphereName) {
+                      return lhs->hemisphereName < rhs->hemisphereName;
+                  }
+                  if (lhs->surfaceName != rhs->surfaceName) {
+                      return lhs->surfaceName < rhs->surfaceName;
+                  }
+                  return lhs->sourceViewIndex < rhs->sourceViewIndex;
+              });
+    return views;
+}
+
+std::vector<double> concatenateDenseVectors(const std::vector<std::vector<double>>& values) {
+    std::vector<double> merged;
+    size_t totalSize = 0;
+    for (const auto& value : values) {
+        totalSize += value.size();
+    }
+    merged.reserve(totalSize);
+    for (const auto& value : values) {
+        merged.insert(merged.end(), value.begin(), value.end());
+    }
+    return merged;
+}
+
+TokenizationAuditSummary buildTokenizationAuditSummary(
+    const std::vector<snnfw::jepa::JepaLatentSample>& samples,
+    const Config& config) {
+    TokenizationAuditSummary summary;
+    summary.family = "branch_by_subregion";
+    summary.schema =
+        "equal contiguous subregions within each branch slice, preserving branch order";
+    summary.configuredSubregionsPerBranch = std::max(1, config.jepa.branchSubregionCount);
+    summary.sampleCount = samples.size();
+
+    double tokensPerViewSum = 0.0;
+    double tokenSizeSum = 0.0;
+    double tokenNonzeroSum = 0.0;
+    double tokenEnergySum = 0.0;
+    size_t tokenCount = 0;
+    for (const auto& sample : samples) {
+        for (const auto& view : sample.hemisphereViews) {
+            ++summary.viewCount;
+            tokensPerViewSum += static_cast<double>(view.branchTokens.size());
+            if (summary.tokenNames.empty()) {
+                for (const auto& token : view.branchTokens) {
+                    summary.tokenNames.push_back(token.name);
+                    summary.tokenSizes.push_back(token.size);
+                }
+            }
+            for (const auto& token : view.branchTokens) {
+                tokenSizeSum += static_cast<double>(token.size);
+                double nonzeroCount = 0.0;
+                double energy = 0.0;
+                for (double value : token.values) {
+                    if (std::abs(value) > 1e-12) {
+                        nonzeroCount += 1.0;
+                    }
+                    energy += value * value;
+                }
+                if (!token.values.empty()) {
+                    tokenNonzeroSum += nonzeroCount / static_cast<double>(token.values.size());
+                }
+                tokenEnergySum += std::sqrt(energy);
+                ++tokenCount;
+            }
+        }
+    }
+
+    if (summary.viewCount > 0) {
+        summary.meanTokensPerView = tokensPerViewSum / static_cast<double>(summary.viewCount);
+        summary.meanTokensPerHemisphere = summary.meanTokensPerView;
+    }
+    if (tokenCount > 0) {
+        summary.meanTokenSize = tokenSizeSum / static_cast<double>(tokenCount);
+        summary.meanTokenNonzeroFraction = tokenNonzeroSum / static_cast<double>(tokenCount);
+        summary.meanTokenL2Energy = tokenEnergySum / static_cast<double>(tokenCount);
+    }
+    return summary;
+}
+
+std::vector<RepresentationAuditSample> buildTemporalSummarySamples(
+    const std::vector<snnfw::jepa::JepaLatentSample>& samples,
+    bool useFutureViews) {
+    std::vector<RepresentationAuditSample> embeddings;
+    embeddings.reserve(samples.size());
+
+    for (const auto& sample : samples) {
+        std::map<std::string, std::vector<const snnfw::jepa::JepaHemisphereView*>> viewsByHemisphere;
+        for (const auto& view : sample.hemisphereViews) {
+            viewsByHemisphere[view.hemisphereName].push_back(&view);
+        }
+
+        std::vector<std::vector<double>> pooledByHemisphere;
+        for (auto& entry : viewsByHemisphere) {
+            auto& views = entry.second;
+            std::sort(views.begin(), views.end(),
+                      [](const snnfw::jepa::JepaHemisphereView* lhs,
+                         const snnfw::jepa::JepaHemisphereView* rhs) {
+                          return lhs->sourceViewIndex < rhs->sourceViewIndex;
+                      });
+            if (views.empty()) {
+                continue;
+            }
+
+            const size_t splitIndex = std::max<size_t>(1, views.size() / 2);
+            const size_t begin = useFutureViews ? splitIndex : 0;
+            const size_t end = useFutureViews ? views.size() : splitIndex;
+            std::vector<std::vector<double>> selected;
+            for (size_t i = begin; i < end && i < views.size(); ++i) {
+                auto values = flattenJepaBranchTokens(*views[i]);
+                if (!values.empty()) {
+                    selected.push_back(std::move(values));
+                }
+            }
+            if (selected.empty()) {
+                auto fallback = flattenJepaBranchTokens(*views.back());
+                if (!fallback.empty()) {
+                    selected.push_back(std::move(fallback));
+                }
+            }
+            auto pooled = meanPoolDenseVectors(selected);
+            if (!pooled.empty()) {
+                pooledByHemisphere.push_back(std::move(pooled));
+            }
+        }
+
+        auto embeddingVector = concatenateDenseVectors(pooledByHemisphere);
+        if (embeddingVector.empty()) {
+            continue;
+        }
+
+        RepresentationAuditSample embedding;
+        embedding.sourceIndex = sample.sourceIndex;
+        embedding.label = sample.label;
+        embedding.embedding = std::move(embeddingVector);
+        embeddings.push_back(std::move(embedding));
+    }
+
+    return embeddings;
+}
+
+ContextAgreementSummary evaluateContextTargetAgreement(
+    std::string name,
+    const std::vector<RepresentationAuditSample>& contexts,
+    const std::vector<RepresentationAuditSample>& targets) {
+    ContextAgreementSummary summary;
+    summary.name = std::move(name);
+    summary.sampleCount = std::min(contexts.size(), targets.size());
+    if (contexts.empty() || targets.empty()) {
+        summary.note = "missing context or target samples";
+        return summary;
+    }
+
+    std::unordered_map<size_t, std::vector<double>> targetBySource;
+    targetBySource.reserve(targets.size());
+    for (const auto& target : targets) {
+        if (!target.embedding.empty()) {
+            targetBySource[target.sourceIndex] = target.embedding;
+        }
+    }
+
+    std::vector<const RepresentationAuditSample*> alignedContexts;
+    alignedContexts.reserve(contexts.size());
+    for (const auto& context : contexts) {
+        const auto it = targetBySource.find(context.sourceIndex);
+        if (it == targetBySource.end() || it->second.size() != context.embedding.size()) {
+            continue;
+        }
+        alignedContexts.push_back(&context);
+    }
+    if (alignedContexts.size() < 2) {
+        summary.note = "insufficient aligned samples";
+        return summary;
+    }
+
+    double sameSum = 0.0;
+    double shuffledSum = 0.0;
+    int compared = 0;
+    for (size_t i = 0; i < alignedContexts.size(); ++i) {
+        const auto* context = alignedContexts[i];
+        const auto& target = targetBySource[context->sourceIndex];
+        sameSum += cosineSimilarity(context->embedding, target);
+
+        size_t shuffledIndex = (i + 1) % alignedContexts.size();
+        if (alignedContexts[shuffledIndex]->sourceIndex == context->sourceIndex) {
+            shuffledIndex = (i + 2) % alignedContexts.size();
+        }
+        const auto shuffledIt = targetBySource.find(alignedContexts[shuffledIndex]->sourceIndex);
+        if (shuffledIt == targetBySource.end() ||
+            shuffledIt->second.size() != context->embedding.size()) {
+            continue;
+        }
+        shuffledSum += cosineSimilarity(context->embedding, shuffledIt->second);
+        ++compared;
+    }
+
+    if (compared <= 0) {
+        summary.note = "failed shuffled comparison";
+        return summary;
+    }
+
+    summary.available = true;
+    summary.sampleCount = static_cast<size_t>(compared);
+    summary.contextDim = alignedContexts.front()->embedding.size();
+    summary.targetDim = targetBySource[alignedContexts.front()->sourceIndex].size();
+    summary.sameImageMeanCosine = sameSum / static_cast<double>(compared);
+    summary.shuffledMeanCosine = shuffledSum / static_cast<double>(compared);
+    summary.agreementMargin = summary.sameImageMeanCosine - summary.shuffledMeanCosine;
+    return summary;
+}
+
+double vectorL2Norm(const std::vector<double>& values) {
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value * value;
+    }
+    return std::sqrt(sum);
+}
+
+std::vector<double> buildTemporalTraceCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views,
+    double decay) {
+    if (views.empty()) {
+        return {};
+    }
+    const auto firstValues = flattenJepaBranchTokens(*views.front());
+    if (firstValues.empty()) {
+        return {};
+    }
+    std::vector<double> trace(firstValues.size(), 0.0);
+    for (const auto* view : views) {
+        const auto values = flattenJepaBranchTokens(*view);
+        if (values.size() != trace.size()) {
+            continue;
+        }
+        for (size_t i = 0; i < trace.size(); ++i) {
+            trace[i] = decay * trace[i] + values[i];
+        }
+    }
+    return trace;
+}
+
+std::vector<double> buildFirstSpikeCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views,
+    double thresholdFraction,
+    double* activeFraction,
+    double* meanFirstPosition,
+    double* timingSpread) {
+    if (activeFraction != nullptr) {
+        *activeFraction = 0.0;
+    }
+    if (meanFirstPosition != nullptr) {
+        *meanFirstPosition = 0.0;
+    }
+    if (timingSpread != nullptr) {
+        *timingSpread = 0.0;
+    }
+    if (views.empty()) {
+        return {};
+    }
+    std::vector<std::vector<double>> perView;
+    perView.reserve(views.size());
+    for (const auto* view : views) {
+        auto values = flattenJepaBranchTokens(*view);
+        if (!values.empty()) {
+            perView.push_back(std::move(values));
+        }
+    }
+    if (perView.empty() || perView.front().empty()) {
+        return {};
+    }
+
+    const size_t dim = perView.front().size();
+    std::vector<double> maxAbs(dim, 0.0);
+    for (const auto& values : perView) {
+        if (values.size() != dim) {
+            continue;
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            maxAbs[i] = std::max(maxAbs[i], std::abs(values[i]));
+        }
+    }
+
+    std::vector<double> code(dim, 0.0);
+    std::vector<double> firstPositions;
+    firstPositions.reserve(dim);
+    const double timeScale = 1.0 / static_cast<double>(std::max<size_t>(1, perView.size()));
+    for (size_t feature = 0; feature < dim; ++feature) {
+        if (maxAbs[feature] <= 1e-12) {
+            continue;
+        }
+        const double threshold = std::max(1e-12, thresholdFraction * maxAbs[feature]);
+        for (size_t t = 0; t < perView.size(); ++t) {
+            if (perView[t].size() != dim) {
+                continue;
+            }
+            const double value = perView[t][feature];
+            if (std::abs(value) < threshold) {
+                continue;
+            }
+            const double position = static_cast<double>(t);
+            const double earlyWeight =
+                static_cast<double>(perView.size() - t) * timeScale;
+            const double sign = value >= 0.0 ? 1.0 : -1.0;
+            code[feature] = sign * earlyWeight;
+            firstPositions.push_back(position);
+            break;
+        }
+    }
+
+    if (!firstPositions.empty()) {
+        const double active = static_cast<double>(firstPositions.size()) /
+                              static_cast<double>(dim);
+        const double mean =
+            std::accumulate(firstPositions.begin(), firstPositions.end(), 0.0) /
+            static_cast<double>(firstPositions.size());
+        double variance = 0.0;
+        for (double position : firstPositions) {
+            const double diff = position - mean;
+            variance += diff * diff;
+        }
+        variance /= static_cast<double>(firstPositions.size());
+        if (activeFraction != nullptr) {
+            *activeFraction = active;
+        }
+        if (meanFirstPosition != nullptr) {
+            *meanFirstPosition = mean * timeScale;
+        }
+        if (timingSpread != nullptr) {
+            *timingSpread = std::sqrt(variance) * timeScale;
+        }
+    }
+    return code;
+}
+
+std::vector<double> buildTemporalDeltaCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views,
+    double* meanDeltaNorm) {
+    if (meanDeltaNorm != nullptr) {
+        *meanDeltaNorm = 0.0;
+    }
+    if (views.size() < 2) {
+        return {};
+    }
+    std::vector<std::vector<double>> perView;
+    perView.reserve(views.size());
+    for (const auto* view : views) {
+        auto values = flattenJepaBranchTokens(*view);
+        if (!values.empty()) {
+            perView.push_back(std::move(values));
+        }
+    }
+    if (perView.size() < 2 || perView.front().empty()) {
+        return {};
+    }
+    const size_t dim = perView.front().size();
+    std::vector<double> code(dim, 0.0);
+    double deltaNormSum = 0.0;
+    int deltaCount = 0;
+    for (size_t t = 1; t < perView.size(); ++t) {
+        if (perView[t - 1].size() != dim || perView[t].size() != dim) {
+            continue;
+        }
+        std::vector<double> delta(dim, 0.0);
+        for (size_t i = 0; i < dim; ++i) {
+            delta[i] = perView[t][i] - perView[t - 1][i];
+            code[i] += delta[i];
+        }
+        deltaNormSum += vectorL2Norm(delta);
+        ++deltaCount;
+    }
+    if (deltaCount > 0) {
+        const double scale = 1.0 / static_cast<double>(deltaCount);
+        for (double& value : code) {
+            value *= scale;
+        }
+        if (meanDeltaNorm != nullptr) {
+            *meanDeltaNorm = deltaNormSum * scale;
+        }
+    }
+    return code;
+}
+
+std::vector<std::vector<double>> flattenTemporalHemisphereViews(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views) {
+    std::vector<std::vector<double>> perView;
+    perView.reserve(views.size());
+    for (const auto* view : views) {
+        auto values = flattenJepaBranchTokens(*view);
+        if (!values.empty()) {
+            perView.push_back(std::move(values));
+        }
+    }
+    return perView;
+}
+
+std::vector<double> buildTemporalPeakCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views) {
+    const auto perView = flattenTemporalHemisphereViews(views);
+    if (perView.empty() || perView.front().empty()) {
+        return {};
+    }
+    const size_t dim = perView.front().size();
+    std::vector<double> code(dim, 0.0);
+    std::vector<double> maxAbs(dim, 0.0);
+    for (const auto& values : perView) {
+        if (values.size() != dim) {
+            continue;
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            const double magnitude = std::abs(values[i]);
+            if (magnitude > maxAbs[i]) {
+                maxAbs[i] = magnitude;
+                code[i] = values[i];
+            }
+        }
+    }
+    return code;
+}
+
+std::vector<double> buildTemporalVarianceCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views) {
+    const auto perView = flattenTemporalHemisphereViews(views);
+    if (perView.size() < 2 || perView.front().empty()) {
+        return {};
+    }
+    const size_t dim = perView.front().size();
+    std::vector<double> mean(dim, 0.0);
+    int count = 0;
+    for (const auto& values : perView) {
+        if (values.size() != dim) {
+            continue;
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            mean[i] += values[i];
+        }
+        ++count;
+    }
+    if (count <= 1) {
+        return {};
+    }
+    const double invCount = 1.0 / static_cast<double>(count);
+    for (double& value : mean) {
+        value *= invCount;
+    }
+
+    std::vector<double> code(dim, 0.0);
+    for (const auto& values : perView) {
+        if (values.size() != dim) {
+            continue;
+        }
+        for (size_t i = 0; i < dim; ++i) {
+            const double diff = values[i] - mean[i];
+            code[i] += diff * diff;
+        }
+    }
+    const double invDof = 1.0 / static_cast<double>(count - 1);
+    for (double& value : code) {
+        value *= invDof;
+    }
+    return code;
+}
+
+std::vector<double> buildTemporalAdaptationCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views) {
+    const auto perView = flattenTemporalHemisphereViews(views);
+    if (perView.size() < 2 || perView.front().empty()) {
+        return {};
+    }
+    const size_t dim = perView.front().size();
+    const auto& first = perView.front();
+    const auto& last = perView.back();
+    if (first.size() != dim || last.size() != dim) {
+        return {};
+    }
+    std::vector<double> code(dim, 0.0);
+    for (size_t i = 0; i < dim; ++i) {
+        code[i] = last[i] - first[i];
+    }
+    return code;
+}
+
+void appendNormalizedTemporalChannel(
+    std::vector<std::vector<double>>* channels,
+    std::vector<double> channel) {
+    if (channels == nullptr || channel.empty()) {
+        return;
+    }
+    normalizeL2(channel);
+    channels->push_back(std::move(channel));
+}
+
+std::vector<double> buildCompositeTemporalCode(
+    const std::vector<const snnfw::jepa::JepaHemisphereView*>& views,
+    const std::string& codeType,
+    double* activeFraction,
+    double* meanFirstPosition,
+    double* timingSpread,
+    double* meanDeltaNorm,
+    double* traceNorm) {
+    double localActiveFraction = 0.0;
+    double localFirstPosition = 0.0;
+    double localTimingSpread = 0.0;
+    double localDeltaNorm = 0.0;
+
+    auto firstSpike = buildFirstSpikeCode(
+        views, 0.30, &localActiveFraction, &localFirstPosition, &localTimingSpread);
+    auto trace = buildTemporalTraceCode(views, 0.70);
+    auto delta = buildTemporalDeltaCode(views, &localDeltaNorm);
+    auto peak = buildTemporalPeakCode(views);
+    auto variance = buildTemporalVarianceCode(views);
+    auto adaptation = buildTemporalAdaptationCode(views);
+    const double localTraceNorm = vectorL2Norm(trace);
+
+    std::vector<std::vector<double>> channels;
+    appendNormalizedTemporalChannel(&channels, std::move(firstSpike));
+    appendNormalizedTemporalChannel(&channels, std::move(trace));
+    appendNormalizedTemporalChannel(&channels, std::move(delta));
+    appendNormalizedTemporalChannel(&channels, std::move(peak));
+    if (codeType == "temporal_onset_sustained_rich") {
+        appendNormalizedTemporalChannel(&channels, std::move(variance));
+        appendNormalizedTemporalChannel(&channels, std::move(adaptation));
+    }
+
+    if (activeFraction != nullptr) {
+        *activeFraction = localActiveFraction;
+    }
+    if (meanFirstPosition != nullptr) {
+        *meanFirstPosition = localFirstPosition;
+    }
+    if (timingSpread != nullptr) {
+        *timingSpread = localTimingSpread;
+    }
+    if (meanDeltaNorm != nullptr) {
+        *meanDeltaNorm = localDeltaNorm;
+    }
+    if (traceNorm != nullptr) {
+        *traceNorm = localTraceNorm;
+    }
+    return concatenateDenseVectors(channels);
+}
+
+uint64_t mixTemporalProjectionIndex(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+std::vector<double> projectTemporalCode(
+    const std::vector<double>& values,
+    size_t outputDim) {
+    if (values.empty() || outputDim == 0U) {
+        return {};
+    }
+    std::vector<double> projected(outputDim, 0.0);
+    for (size_t i = 0; i < values.size(); ++i) {
+        const uint64_t mixed = mixTemporalProjectionIndex(static_cast<uint64_t>(i));
+        const size_t bucket = static_cast<size_t>(mixed % outputDim);
+        const double sign = ((mixed >> 63U) == 0U) ? 1.0 : -1.0;
+        projected[bucket] += sign * values[i];
+    }
+    normalizeL2(projected);
+    return projected;
+}
+
+std::vector<RepresentationAuditSample> buildTemporalSpikeCodeSamples(
+    const std::vector<snnfw::jepa::JepaLatentSample>& samples,
+    const std::string& codeType,
+    TemporalSpikeCodeAuditMetrics* stats) {
+    std::vector<RepresentationAuditSample> embeddings;
+    embeddings.reserve(samples.size());
+
+    double activeFractionSum = 0.0;
+    double firstPositionSum = 0.0;
+    double timingSpreadSum = 0.0;
+    double deltaNormSum = 0.0;
+    double traceNormSum = 0.0;
+    int statCount = 0;
+
+    for (const auto& sample : samples) {
+        std::map<std::string, std::vector<const snnfw::jepa::JepaHemisphereView*>> viewsByHemisphere;
+        for (const auto& view : sample.hemisphereViews) {
+            viewsByHemisphere[view.hemisphereName].push_back(&view);
+        }
+
+        std::vector<std::vector<double>> perHemisphereCode;
+        for (auto& entry : viewsByHemisphere) {
+            auto& views = entry.second;
+            std::sort(views.begin(), views.end(),
+                      [](const snnfw::jepa::JepaHemisphereView* lhs,
+                         const snnfw::jepa::JepaHemisphereView* rhs) {
+                          return lhs->sourceViewIndex < rhs->sourceViewIndex;
+                      });
+
+            std::vector<double> code;
+            if (codeType == "first_spike_rank") {
+                double activeFraction = 0.0;
+                double firstPosition = 0.0;
+                double timingSpread = 0.0;
+                code = buildFirstSpikeCode(
+                    views, 0.35, &activeFraction, &firstPosition, &timingSpread);
+                activeFractionSum += activeFraction;
+                firstPositionSum += firstPosition;
+                timingSpreadSum += timingSpread;
+                ++statCount;
+            } else if (codeType == "temporal_delta") {
+                double deltaNorm = 0.0;
+                code = buildTemporalDeltaCode(views, &deltaNorm);
+                deltaNormSum += deltaNorm;
+                ++statCount;
+            } else if (codeType == "temporal_onset_sustained" ||
+                       codeType == "temporal_onset_sustained_rich" ||
+                       codeType == "temporal_onset_sustained_projected" ||
+                       codeType == "temporal_onset_sustained_rich_projected") {
+                double activeFraction = 0.0;
+                double firstPosition = 0.0;
+                double timingSpread = 0.0;
+                double deltaNorm = 0.0;
+                double traceNorm = 0.0;
+                const std::string compositeType =
+                    codeType == "temporal_onset_sustained_projected"
+                        ? "temporal_onset_sustained"
+                        : (codeType == "temporal_onset_sustained_rich_projected"
+                               ? "temporal_onset_sustained_rich"
+                               : codeType);
+                code = buildCompositeTemporalCode(
+                    views, compositeType, &activeFraction, &firstPosition, &timingSpread,
+                    &deltaNorm, &traceNorm);
+                if (codeType == "temporal_onset_sustained_projected" ||
+                    codeType == "temporal_onset_sustained_rich_projected") {
+                    code = projectTemporalCode(code, 32768U);
+                }
+                activeFractionSum += activeFraction;
+                firstPositionSum += firstPosition;
+                timingSpreadSum += timingSpread;
+                deltaNormSum += deltaNorm;
+                traceNormSum += traceNorm;
+                ++statCount;
+            } else {
+                code = buildTemporalTraceCode(views, 0.65);
+                traceNormSum += vectorL2Norm(code);
+                ++statCount;
+            }
+
+            if (!code.empty()) {
+                perHemisphereCode.push_back(std::move(code));
+            }
+        }
+
+        auto embeddingVector = concatenateDenseVectors(perHemisphereCode);
+        if (embeddingVector.empty()) {
+            continue;
+        }
+        RepresentationAuditSample embedding;
+        embedding.sourceIndex = sample.sourceIndex;
+        embedding.label = sample.label;
+        embedding.embedding = std::move(embeddingVector);
+        embeddings.push_back(std::move(embedding));
+    }
+
+    if (stats != nullptr && statCount > 0) {
+        const double scale = 1.0 / static_cast<double>(statCount);
+        stats->meanActiveFraction = activeFractionSum * scale;
+        stats->meanFirstSpikePosition = firstPositionSum * scale;
+        stats->meanTimingSpread = timingSpreadSum * scale;
+        stats->meanAdjacentDeltaNorm = deltaNormSum * scale;
+        stats->meanTraceNorm = traceNormSum * scale;
+    }
+    return embeddings;
 }
 
 std::vector<RepresentationAuditSample> buildDirectRepresentationSamples(
@@ -1512,9 +2315,10 @@ RepresentationAuditReport runJepaRepresentationAudit(
     const Config& config,
     const snnfw::jepa::JepaTrainingArtifacts* artifacts) {
     RepresentationAuditReport report;
-    if (!config.jepaRepresentationAuditEnabled) {
+    if (!config.jepaRepresentationAuditEnabled && !config.temporalSpikeCodeAuditEnabled) {
         return report;
     }
+    report.temporalSpikeCodeAudit.enabled = config.temporalSpikeCodeAuditEnabled;
 
     auto buildSurfaceSamples =
         [&](const Config& auditConfig,
@@ -1550,12 +2354,131 @@ RepresentationAuditReport runJepaRepresentationAudit(
                 config.numClasses));
         };
 
+    auto appendTemporalTargetSurface =
+        [&](const std::string& name,
+            const std::string& surface,
+            bool recurrent,
+            const Config& auditConfig) {
+            const auto trainSamples = buildSurfaceSamples(auditConfig, true);
+            const auto testSamples = buildSurfaceSamples(auditConfig, false);
+            auto trainEmbeddings = buildTemporalSummarySamples(trainSamples, true);
+            auto testEmbeddings = buildTemporalSummarySamples(testSamples, true);
+            truncateRepresentationAuditSamples(
+                &trainEmbeddings, config.jepaRepresentationAuditSampleLimit);
+            truncateRepresentationAuditSamples(
+                &testEmbeddings, config.jepaRepresentationAuditSampleLimit);
+            report.metrics.push_back(evaluateRepresentationAuditMetrics(
+                name,
+                surface,
+                recurrent,
+                false,
+                trainEmbeddings,
+                testEmbeddings,
+                trainSamples,
+                testSamples,
+                config.numClasses));
+        };
+
+    auto appendContextAudit =
+        [&](const std::string& name,
+            const Config& auditConfig) {
+            const auto trainSamples = buildSurfaceSamples(auditConfig, true);
+            const auto testSamples = buildSurfaceSamples(auditConfig, false);
+            auto trainContexts = buildTemporalSummarySamples(trainSamples, false);
+            auto trainTargets = buildTemporalSummarySamples(trainSamples, true);
+            auto testContexts = buildTemporalSummarySamples(testSamples, false);
+            auto testTargets = buildTemporalSummarySamples(testSamples, true);
+            truncateRepresentationAuditSamples(
+                &trainContexts, config.jepaRepresentationAuditSampleLimit);
+            truncateRepresentationAuditSamples(
+                &trainTargets, config.jepaRepresentationAuditSampleLimit);
+            truncateRepresentationAuditSamples(
+                &testContexts, config.jepaRepresentationAuditSampleLimit);
+            truncateRepresentationAuditSamples(
+                &testTargets, config.jepaRepresentationAuditSampleLimit);
+            auto trainAgreement = evaluateContextTargetAgreement(
+                name + " (train)", trainContexts, trainTargets);
+            auto testAgreement = evaluateContextTargetAgreement(
+                name + " (test)", testContexts, testTargets);
+            report.contextAudits.push_back(std::move(trainAgreement));
+            report.contextAudits.push_back(std::move(testAgreement));
+            if (report.tokenization.sampleCount == 0U) {
+                report.tokenization = buildTokenizationAuditSummary(trainSamples, auditConfig);
+            }
+        };
+
+    auto appendTemporalSpikeCodeAudit =
+        [&](const std::string& name,
+            const std::string& codeType,
+            const Config& auditConfig) {
+            const auto trainSamples = buildSurfaceSamples(auditConfig, true);
+            const auto testSamples = buildSurfaceSamples(auditConfig, false);
+            TemporalSpikeCodeAuditMetrics trainStats;
+            TemporalSpikeCodeAuditMetrics testStats;
+            auto trainEmbeddings =
+                buildTemporalSpikeCodeSamples(trainSamples, codeType, &trainStats);
+            auto testEmbeddings =
+                buildTemporalSpikeCodeSamples(testSamples, codeType, &testStats);
+            truncateRepresentationAuditSamples(
+                &trainEmbeddings, config.jepaRepresentationAuditSampleLimit);
+            truncateRepresentationAuditSamples(
+                &testEmbeddings, config.jepaRepresentationAuditSampleLimit);
+
+            TemporalSpikeCodeAuditMetrics metrics;
+            metrics.name = name;
+            metrics.codeType = codeType;
+            metrics.meanActiveFraction = testStats.meanActiveFraction;
+            metrics.meanFirstSpikePosition = testStats.meanFirstSpikePosition;
+            metrics.meanTimingSpread = testStats.meanTimingSpread;
+            metrics.meanAdjacentDeltaNorm = testStats.meanAdjacentDeltaNorm;
+            metrics.meanTraceNorm = testStats.meanTraceNorm;
+            metrics.separability = evaluateRepresentationAuditMetrics(
+                name,
+                codeType,
+                false,
+                false,
+                trainEmbeddings,
+                testEmbeddings,
+                trainSamples,
+                testSamples,
+                config.numClasses);
+            metrics.available = metrics.separability.available;
+            metrics.note = metrics.separability.note;
+            report.temporalSpikeCodeAudit.metrics.push_back(std::move(metrics));
+        };
+
     Config rawConfig = config;
     rawConfig.jepa.enabled = true;
     rawConfig.jepa.includeHemisphereToken = true;
     rawConfig.jepa.tapSurface = snnfw::jepa::TapSurface::RawStage1;
     rawConfig.recurrentSensoryStateEnabled = false;
     appendDirectSurface("Raw Stage1 Direct", "raw_stage1", false, rawConfig);
+
+    Config structuredRawConfig = rawConfig;
+    structuredRawConfig.jepa.includeHemisphereToken = false;
+    structuredRawConfig.jepa.includeBranchTokens = true;
+    report.tokenization = buildTokenizationAuditSummary(
+        buildSurfaceSamples(structuredRawConfig, true), structuredRawConfig);
+    appendTemporalTargetSurface(
+        "Future Hemisphere Summary Target", "raw_stage1_structured_future_summary", false,
+        structuredRawConfig);
+    appendContextAudit("Structured Multifixation Context", structuredRawConfig);
+    if (config.temporalSpikeCodeAuditEnabled) {
+        appendTemporalSpikeCodeAudit(
+            "Temporal Discounted Trace Code", "discounted_trace", structuredRawConfig);
+        appendTemporalSpikeCodeAudit(
+            "Temporal First-Spike Rank Code", "first_spike_rank", structuredRawConfig);
+        appendTemporalSpikeCodeAudit(
+            "Temporal Delta Code", "temporal_delta", structuredRawConfig);
+        appendTemporalSpikeCodeAudit(
+            "Temporal Projected Onset-Sustained Code",
+            "temporal_onset_sustained_projected",
+            structuredRawConfig);
+        appendTemporalSpikeCodeAudit(
+            "Temporal Projected Rich Onset-Sustained Code",
+            "temporal_onset_sustained_rich_projected",
+            structuredRawConfig);
+    }
 
     Config promotedConfig = config;
     promotedConfig.jepa.enabled = true;
@@ -1571,6 +2494,21 @@ RepresentationAuditReport runJepaRepresentationAudit(
     recurrentConfig.recurrentSensoryStateEnabled = true;
     appendDirectSurface(
         "Recurrent Fixation Direct", "promoted_stage1_recurrent", true, recurrentConfig);
+
+    Config structuredRecurrentConfig = recurrentConfig;
+    structuredRecurrentConfig.jepa.includeHemisphereToken = false;
+    structuredRecurrentConfig.jepa.includeBranchTokens = true;
+    appendTemporalTargetSurface(
+        "Recurrent Future Sensory Summary Target",
+        "promoted_stage1_recurrent_future_summary",
+        true,
+        structuredRecurrentConfig);
+
+    RepresentationAuditMetrics unavailableTarget;
+    unavailableTarget.name = "Future Object-Centric Summary Target";
+    unavailableTarget.surface = "object_centric_unavailable";
+    unavailableTarget.note = "object-centric summary surface is not implemented in current CIFAR path";
+    report.metrics.push_back(std::move(unavailableTarget));
 
     RepresentationAuditMetrics jepaMetrics;
     jepaMetrics.name = "JEPA Embedding";
@@ -1601,6 +2539,110 @@ RepresentationAuditReport runJepaRepresentationAudit(
             config.numClasses));
     }
 
+    auto findMetric = [&](const std::string& name) -> const RepresentationAuditMetrics* {
+        for (const auto& metrics : report.metrics) {
+            if (metrics.name == name) {
+                return &metrics;
+            }
+        }
+        return nullptr;
+    };
+    auto findContextAudit = [&](const std::string& name) -> const ContextAgreementSummary* {
+        for (const auto& audit : report.contextAudits) {
+            if (audit.name == name) {
+                return &audit;
+            }
+        }
+        return nullptr;
+    };
+
+    const auto* futureSummaryTarget =
+        findMetric("Future Hemisphere Summary Target");
+    const auto* rawDirect = findMetric("Raw Stage1 Direct");
+    const auto* recurrentDirect = findMetric("Recurrent Fixation Direct");
+    const auto* testContextAudit =
+        findContextAudit("Structured Multifixation Context (test)");
+    double stage2Reference = 0.0;
+    if (rawDirect != nullptr && rawDirect->available) {
+        stage2Reference = std::max(stage2Reference, rawDirect->testNearestNeighborAccuracy);
+    }
+    if (recurrentDirect != nullptr && recurrentDirect->available) {
+        stage2Reference = std::max(stage2Reference, recurrentDirect->testNearestNeighborAccuracy);
+    }
+
+    report.reviewGate.stage1Complete =
+        report.tokenization.viewCount > 0 &&
+        report.tokenization.meanTokensPerView > 3.0;
+    report.reviewGate.stage2Complete =
+        futureSummaryTarget != nullptr &&
+        futureSummaryTarget->available &&
+        futureSummaryTarget->testNearestNeighborAccuracy >= stage2Reference;
+    report.reviewGate.stage3Complete =
+        testContextAudit != nullptr &&
+        testContextAudit->available &&
+        testContextAudit->agreementMargin > 0.0;
+    report.reviewGate.stage4Complete = true;
+    report.reviewGate.tokenization =
+        "branch-by-subregion, equal contiguous subregions per branch";
+    report.reviewGate.targetSurface =
+        futureSummaryTarget != nullptr && futureSummaryTarget->available
+            ? futureSummaryTarget->name
+            : "not locked";
+    report.reviewGate.contextDefinition =
+        "multiple past fixations, both hemispheres, structured branch-by-subregion summaries";
+    report.reviewGate.futureProbeEmbedding =
+        "predicted future hemisphere summary embedding, with predictor-exposed probe as the primary surface";
+    report.reviewGate.goForTrainerRedesign =
+        report.reviewGate.stage1Complete &&
+        report.reviewGate.stage2Complete &&
+        report.reviewGate.stage3Complete &&
+        report.reviewGate.stage4Complete;
+    std::ostringstream decision;
+    decision << (report.reviewGate.goForTrainerRedesign ? "go" : "hold")
+             << ": Stage1=" << (report.reviewGate.stage1Complete ? "pass" : "fail")
+             << ", Stage2=" << (report.reviewGate.stage2Complete ? "pass" : "fail")
+             << ", Stage3=" << (report.reviewGate.stage3Complete ? "pass" : "fail")
+             << ", Stage4=" << (report.reviewGate.stage4Complete ? "pass" : "fail");
+    if (futureSummaryTarget != nullptr && futureSummaryTarget->available) {
+        decision << ", future_target_test_nn="
+                 << std::fixed << std::setprecision(2)
+                 << futureSummaryTarget->testNearestNeighborAccuracy;
+    }
+    if (testContextAudit != nullptr && testContextAudit->available) {
+        decision << ", context_margin="
+                 << std::fixed << std::setprecision(4)
+                 << testContextAudit->agreementMargin;
+    }
+    report.reviewGate.decision = decision.str();
+
+    if (config.temporalSpikeCodeAuditEnabled) {
+        double referenceAccuracy = stage2Reference;
+        double bestTemporalAccuracy = 0.0;
+        std::string bestName;
+        for (const auto& metrics : report.temporalSpikeCodeAudit.metrics) {
+            if (!metrics.available) {
+                continue;
+            }
+            const double accuracy = metrics.separability.testNearestNeighborAccuracy;
+            if (accuracy > bestTemporalAccuracy) {
+                bestTemporalAccuracy = accuracy;
+                bestName = metrics.name;
+            }
+        }
+        report.temporalSpikeCodeAudit.referenceAccuracy = referenceAccuracy;
+        report.temporalSpikeCodeAudit.bestTemporalAccuracy = bestTemporalAccuracy;
+        report.temporalSpikeCodeAudit.gatePassed =
+            bestTemporalAccuracy > referenceAccuracy;
+        std::ostringstream temporalDecision;
+        temporalDecision << (report.temporalSpikeCodeAudit.gatePassed ? "go" : "hold")
+                         << ": best_temporal_code="
+                         << (bestName.empty() ? "none" : bestName)
+                         << ", best_test_nn=" << std::fixed << std::setprecision(2)
+                         << bestTemporalAccuracy
+                         << ", reference_direct_nn=" << referenceAccuracy;
+        report.temporalSpikeCodeAudit.decision = temporalDecision.str();
+    }
+
     const std::string outputPath = defaultJepaRepresentationAuditOutputPath(config);
     report.outputPath = outputPath;
     nlohmann::json root;
@@ -1626,6 +2668,20 @@ RepresentationAuditReport runJepaRepresentationAudit(
             {"target_variance", artifacts->summary.targetVariance},
         };
     }
+    root["stage1_tokenization"] = {
+        {"family", report.tokenization.family},
+        {"schema", report.tokenization.schema},
+        {"configured_subregions_per_branch", report.tokenization.configuredSubregionsPerBranch},
+        {"sample_count", report.tokenization.sampleCount},
+        {"view_count", report.tokenization.viewCount},
+        {"mean_tokens_per_view", report.tokenization.meanTokensPerView},
+        {"mean_tokens_per_hemisphere", report.tokenization.meanTokensPerHemisphere},
+        {"mean_token_size", report.tokenization.meanTokenSize},
+        {"mean_token_nonzero_fraction", report.tokenization.meanTokenNonzeroFraction},
+        {"mean_token_l2_energy", report.tokenization.meanTokenL2Energy},
+        {"token_names", report.tokenization.tokenNames},
+        {"token_sizes", report.tokenization.tokenSizes},
+    };
 
     root["representations"] = nlohmann::json::array();
     for (const auto& metrics : report.metrics) {
@@ -1651,6 +2707,66 @@ RepresentationAuditReport runJepaRepresentationAudit(
             {"test_fixation_groups", metrics.testConsistency.groupedSequenceCount},
         });
     }
+    root["stage3_context_audits"] = nlohmann::json::array();
+    for (const auto& audit : report.contextAudits) {
+        root["stage3_context_audits"].push_back({
+            {"name", audit.name},
+            {"available", audit.available},
+            {"note", audit.note},
+            {"sample_count", audit.sampleCount},
+            {"context_dim", audit.contextDim},
+            {"target_dim", audit.targetDim},
+            {"same_image_mean_cosine", audit.sameImageMeanCosine},
+            {"shuffled_mean_cosine", audit.shuffledMeanCosine},
+            {"agreement_margin", audit.agreementMargin},
+        });
+    }
+    root["stage6_temporal_spike_code_audit"] = {
+        {"enabled", report.temporalSpikeCodeAudit.enabled},
+        {"gate_passed", report.temporalSpikeCodeAudit.gatePassed},
+        {"reference_direct_nn_accuracy", report.temporalSpikeCodeAudit.referenceAccuracy},
+        {"best_temporal_nn_accuracy", report.temporalSpikeCodeAudit.bestTemporalAccuracy},
+        {"decision", report.temporalSpikeCodeAudit.decision},
+        {"codes", nlohmann::json::array()},
+    };
+    for (const auto& metrics : report.temporalSpikeCodeAudit.metrics) {
+        root["stage6_temporal_spike_code_audit"]["codes"].push_back({
+            {"name", metrics.name},
+            {"code_type", metrics.codeType},
+            {"available", metrics.available},
+            {"note", metrics.note},
+            {"train_sample_count", metrics.separability.trainSampleCount},
+            {"test_sample_count", metrics.separability.testSampleCount},
+            {"embedding_dim", metrics.separability.embeddingDim},
+            {"train_leave_one_out_accuracy",
+             metrics.separability.trainLeaveOneOutAccuracy},
+            {"test_nearest_neighbor_accuracy",
+             metrics.separability.testNearestNeighborAccuracy},
+            {"test_centroid_accuracy", metrics.separability.testCentroidAccuracy},
+            {"test_mean_centroid_margin", metrics.separability.testMeanCentroidMargin},
+            {"test_adjacent_fixation_cosine",
+             metrics.separability.testConsistency.adjacentMeanCosine},
+            {"test_all_pair_fixation_cosine",
+             metrics.separability.testConsistency.allPairMeanCosine},
+            {"mean_active_fraction", metrics.meanActiveFraction},
+            {"mean_first_spike_position", metrics.meanFirstSpikePosition},
+            {"mean_timing_spread", metrics.meanTimingSpread},
+            {"mean_adjacent_delta_norm", metrics.meanAdjacentDeltaNorm},
+            {"mean_trace_norm", metrics.meanTraceNorm},
+        });
+    }
+    root["stage5_pretrainer_review"] = {
+        {"stage1_complete", report.reviewGate.stage1Complete},
+        {"stage2_complete", report.reviewGate.stage2Complete},
+        {"stage3_complete", report.reviewGate.stage3Complete},
+        {"stage4_complete", report.reviewGate.stage4Complete},
+        {"go_for_trainer_redesign", report.reviewGate.goForTrainerRedesign},
+        {"tokenization", report.reviewGate.tokenization},
+        {"target_surface", report.reviewGate.targetSurface},
+        {"context_definition", report.reviewGate.contextDefinition},
+        {"future_probe_embedding", report.reviewGate.futureProbeEmbedding},
+        {"decision", report.reviewGate.decision},
+    };
 
     const std::filesystem::path path(outputPath);
     if (path.has_parent_path()) {
@@ -1663,6 +2779,11 @@ RepresentationAuditReport runJepaRepresentationAudit(
     out << root.dump(2) << '\n';
 
     std::cout << "\n=== JEPA Representation Audit ===" << std::endl;
+    std::cout << "  Stage 1 tokenization: family=" << report.tokenization.family
+              << ", subregions/branch=" << report.tokenization.configuredSubregionsPerBranch
+              << ", mean_tokens/view=" << std::fixed << std::setprecision(2)
+              << report.tokenization.meanTokensPerView
+              << ", mean_token_size=" << report.tokenization.meanTokenSize << std::endl;
     for (const auto& metrics : report.metrics) {
         std::cout << "  " << metrics.name << ": ";
         if (!metrics.available) {
@@ -1680,6 +2801,44 @@ RepresentationAuditReport runJepaRepresentationAudit(
                   << ", test_fix_adj=" << metrics.testConsistency.adjacentMeanCosine
                   << ", dim=" << metrics.embeddingDim << std::endl;
     }
+    for (const auto& audit : report.contextAudits) {
+        std::cout << "  " << audit.name << ": ";
+        if (!audit.available) {
+            std::cout << "skipped";
+            if (!audit.note.empty()) {
+                std::cout << " (" << audit.note << ")";
+            }
+            std::cout << std::endl;
+            continue;
+        }
+        std::cout << "same=" << std::fixed << std::setprecision(4)
+                  << audit.sameImageMeanCosine
+                  << ", shuffled=" << audit.shuffledMeanCosine
+                  << ", margin=" << audit.agreementMargin << std::endl;
+    }
+    if (report.temporalSpikeCodeAudit.enabled) {
+        std::cout << "  Stage 6 temporal spike-code audit: "
+                  << report.temporalSpikeCodeAudit.decision << std::endl;
+        for (const auto& metrics : report.temporalSpikeCodeAudit.metrics) {
+            std::cout << "    " << metrics.name << ": ";
+            if (!metrics.available) {
+                std::cout << "skipped";
+                if (!metrics.note.empty()) {
+                    std::cout << " (" << metrics.note << ")";
+                }
+                std::cout << std::endl;
+                continue;
+            }
+            std::cout << "test_nn=" << std::fixed << std::setprecision(2)
+                      << metrics.separability.testNearestNeighborAccuracy
+                      << "%, centroid=" << metrics.separability.testCentroidAccuracy
+                      << "%, active=" << metrics.meanActiveFraction
+                      << ", first_pos=" << metrics.meanFirstSpikePosition
+                      << ", timing_spread=" << metrics.meanTimingSpread
+                      << ", dim=" << metrics.separability.embeddingDim << std::endl;
+        }
+    }
+    std::cout << "  Stage 5 review: " << report.reviewGate.decision << std::endl;
     std::cout << "  Audit path: " << outputPath << std::endl;
     return report;
 }
@@ -2272,6 +3431,9 @@ std::vector<double> buildJepaTapPattern(HemisphereRuntime& hemisphere,
     if (useRawStage1 || rawPattern.empty()) {
         return rawPattern;
     }
+    if (promotedTapSurfaceAliasesRawStage1(config)) {
+        return rawPattern;
+    }
 
     FigureGroundState figureGroundState;
     if (useFigureGroundStage(config)) {
@@ -2325,7 +3487,8 @@ std::vector<Stage1TapInput> buildJepaStage1TapInputs(
     const std::string surfaceName = useRawStage1 ? "raw_stage1" : "promoted_stage1";
     const bool temporalTargetMode =
         config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalFixation ||
-        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalHemisphereSummary;
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalHemisphereSummary ||
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalSpikeCode;
     const bool useTemporalFixationTaps = temporalTargetMode && config.saccadeFixations > 1;
 
     for (auto& hemisphere : hemispheres) {
@@ -2439,7 +3602,8 @@ std::vector<Stage1TapInput> buildJepaStage1EvalTapInputs(
     const std::string surfaceName = useRawStage1 ? "raw_stage1" : "promoted_stage1";
     const bool temporalTargetMode =
         config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalFixation ||
-        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalHemisphereSummary;
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalHemisphereSummary ||
+        config.jepa.targetMode == snnfw::jepa::TargetMode::TemporalSpikeCode;
     const bool useTemporalFixationTaps = temporalTargetMode && config.saccadeFixations > 1;
     taps.reserve(indices.size() * hemispheres.size());
 
@@ -2643,7 +3807,10 @@ JepaProbeResult evaluateJepaProbe(std::vector<HemisphereRuntime>& hemispheres,
                                  config.seed);
     } else {
         classifier = makeClassifierStrategy(
-            config.classifier, config.knnK, config.classifierExponent, config);
+            config.jepa.probeClassifier,
+            config.jepa.probeK,
+            config.jepa.probeExponent,
+            config);
     }
     const auto evalTaps = buildJepaStage1EvalTapInputs(hemispheres, testLoader, indices, config);
     const auto evalSamples = snnfw::jepa::buildStage1LatentSamples(evalTaps, config.jepa);
@@ -2678,6 +3845,157 @@ JepaProbeResult evaluateJepaProbe(std::vector<HemisphereRuntime>& hemispheres,
     const auto end = std::chrono::high_resolution_clock::now();
     result.seconds = std::chrono::duration<double>(end - start).count();
     return result;
+}
+
+TemporalSpikeCodeProbeResult evaluateTemporalSpikeCodeProbe(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& trainLoader,
+    const VisualDomainAdapter& testLoader,
+    const std::vector<size_t>& indices,
+    const Config& config,
+    const std::string& label) {
+    TemporalSpikeCodeProbeResult result;
+    result.confusion.assign(
+        static_cast<size_t>(config.numClasses),
+        std::vector<int>(static_cast<size_t>(config.numClasses), 0));
+    const auto start = std::chrono::high_resolution_clock::now();
+
+    Config structuredConfig = config;
+    structuredConfig.jepa.enabled = true;
+    structuredConfig.jepa.includeHemisphereToken = false;
+    structuredConfig.jepa.includeBranchTokens = true;
+    structuredConfig.jepa.tapSurface = snnfw::jepa::TapSurface::RawStage1;
+
+    const auto trainTaps = buildJepaStage1TapInputs(hemispheres, trainLoader, structuredConfig);
+    const auto trainSamples =
+        snnfw::jepa::buildStage1LatentSamples(trainTaps, structuredConfig.jepa);
+    auto trainEmbeddings =
+        buildTemporalSpikeCodeSamples(trainSamples, config.temporalSpikeCodeProbeType, nullptr);
+
+    std::vector<ClassificationStrategy::LabeledPattern> trainingPatterns;
+    trainingPatterns.reserve(trainEmbeddings.size());
+    for (auto& sample : trainEmbeddings) {
+        if (sample.label < 0 || sample.embedding.empty()) {
+            continue;
+        }
+        trainingPatterns.emplace_back(std::move(sample.embedding), sample.label);
+    }
+    if (trainingPatterns.empty()) {
+        throw std::runtime_error("Temporal spike-code probe found no valid training embeddings");
+    }
+
+    auto classifier = makeClassifierStrategy(
+        config.jepa.probeClassifier,
+        config.jepa.probeK,
+        config.jepa.probeExponent,
+        config);
+
+    const auto evalTaps =
+        buildJepaStage1EvalTapInputs(hemispheres, testLoader, indices, structuredConfig);
+    const auto evalSamples =
+        snnfw::jepa::buildStage1LatentSamples(evalTaps, structuredConfig.jepa);
+    auto evalEmbeddings =
+        buildTemporalSpikeCodeSamples(evalSamples, config.temporalSpikeCodeProbeType, nullptr);
+
+    const int maxTests = static_cast<int>(evalEmbeddings.size());
+    const int progressStep = maxTests >= 1000 ? 200 : (maxTests >= 200 ? 50 : 25);
+    for (const auto& sample : evalEmbeddings) {
+        if (sample.label < 0 || sample.label >= config.numClasses || sample.embedding.empty()) {
+            continue;
+        }
+        const int predicted =
+            classifier->classify(sample.embedding, trainingPatterns, cosineSimilarity);
+        result.confusion[static_cast<size_t>(sample.label)][static_cast<size_t>(predicted)]++;
+        result.correct += (predicted == sample.label) ? 1 : 0;
+        result.tested++;
+
+        if (result.tested % progressStep == 0) {
+            const double acc =
+                100.0 * static_cast<double>(result.correct) /
+                static_cast<double>(std::max(1, result.tested));
+            std::cout << "  " << label << ": " << result.tested << "/" << maxTests
+                      << " (" << std::fixed << std::setprecision(2) << acc << "%)" << std::endl;
+        }
+    }
+
+    const auto end = std::chrono::high_resolution_clock::now();
+    result.seconds = std::chrono::duration<double>(end - start).count();
+    return result;
+}
+
+int onlineTraceTopK(const Config& config);
+std::vector<LabelTrace> collectTopHypotheses(const std::vector<double>& confidence, int k);
+
+std::optional<snnfw::jepa::JepaPredictionError> computeTemporalSpikePredictionError(
+    std::vector<HemisphereRuntime>& hemispheres,
+    const VisualDomainAdapter& loader,
+    size_t sourceIndex,
+    const Config& config,
+    const snnfw::jepa::JepaModel* model) {
+    if (model == nullptr || !model->temporalSpikeCodeAligned) {
+        return std::nullopt;
+    }
+    Config structuredConfig = config;
+    structuredConfig.jepa.enabled = true;
+    structuredConfig.jepa.targetMode = snnfw::jepa::TargetMode::TemporalSpikeCode;
+    structuredConfig.jepa.includeHemisphereToken = false;
+    structuredConfig.jepa.includeBranchTokens = true;
+    structuredConfig.jepa.tapSurface = snnfw::jepa::TapSurface::RawStage1;
+    const std::vector<size_t> oneIndex{sourceIndex};
+    const auto taps =
+        buildJepaStage1EvalTapInputs(hemispheres, loader, oneIndex, structuredConfig);
+    const auto samples =
+        snnfw::jepa::buildStage1LatentSamples(taps, structuredConfig.jepa);
+    if (samples.empty()) {
+        return std::nullopt;
+    }
+    auto error = snnfw::jepa::evaluateTemporalPredictionError(samples.front(), *model);
+    if (!error.available) {
+        return std::nullopt;
+    }
+    return error;
+}
+
+void applyTemporalSpikePredictionErrorFeedback(
+    BilateralDecisionTrace& decision,
+    const std::optional<snnfw::jepa::JepaPredictionError>& predictionError,
+    const Config& config) {
+    if ((!config.temporalSpikePredictionErrorFeedbackEnabled &&
+         !config.temporalSpikePredictionErrorReplayOnlyEnabled) ||
+        !predictionError.has_value() ||
+        !predictionError->available) {
+        return;
+    }
+    decision.temporalSpikePredictionErrorAvailable = true;
+    decision.temporalSpikePredictionError = predictionError->error;
+    decision.temporalSpikePredictionCosine = predictionError->cosine;
+    if (!config.temporalSpikePredictionErrorFeedbackEnabled) {
+        return;
+    }
+    if (decision.predicted < 0 ||
+        static_cast<size_t>(decision.predicted) >= decision.combinedConfidence.size() ||
+        decision.combinedConfidence.empty()) {
+        return;
+    }
+
+    const double threshold =
+        std::clamp(config.temporalSpikePredictionErrorFeedbackThreshold, 0.0, 1.0);
+    const double errorGate =
+        (predictionError->error - threshold) / std::max(1e-9, 1.0 - threshold);
+    const double penalty = std::clamp(
+        config.temporalSpikePredictionErrorFeedbackGain * errorGate,
+        0.0,
+        config.temporalSpikePredictionErrorFeedbackMaxPenalty);
+    if (penalty <= 0.0) {
+        return;
+    }
+
+    decision.combinedConfidence[static_cast<size_t>(decision.predicted)] *=
+        std::clamp(1.0 - penalty, 0.0, 1.0);
+    normalizeSum(decision.combinedConfidence);
+    decision.topHypotheses =
+        collectTopHypotheses(decision.combinedConfidence, onlineTraceTopK(config));
+    decision.predicted = decision.topHypotheses.empty() ? -1 : decision.topHypotheses.front().label;
 }
 
 std::string trim(std::string value) {
@@ -2915,6 +4233,24 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
     if (corpusDisagreementGainIt != irConfig.doubleParams.end()) {
         config.corpusDisagreementGain = corpusDisagreementGainIt->second;
     }
+    const auto corpusDisagreementArbiterEnabledIt =
+        irConfig.intParams.find("corpus_disagreement_arbiter_enabled");
+    if (corpusDisagreementArbiterEnabledIt != irConfig.intParams.end()) {
+        config.corpusDisagreementArbiterEnabled =
+            corpusDisagreementArbiterEnabledIt->second != 0;
+    }
+    const auto corpusDisagreementArbiterMinMarginIt =
+        irConfig.doubleParams.find("corpus_disagreement_arbiter_min_margin");
+    if (corpusDisagreementArbiterMinMarginIt != irConfig.doubleParams.end()) {
+        config.corpusDisagreementArbiterMinMargin =
+            std::max(0.0, corpusDisagreementArbiterMinMarginIt->second);
+    }
+    const auto corpusDisagreementArbiterMarginDeltaIt =
+        irConfig.doubleParams.find("corpus_disagreement_arbiter_margin_delta");
+    if (corpusDisagreementArbiterMarginDeltaIt != irConfig.doubleParams.end()) {
+        config.corpusDisagreementArbiterMarginDelta =
+            std::max(0.0, corpusDisagreementArbiterMarginDeltaIt->second);
+    }
     const auto predictionErrorFeedbackEnabledIt =
         irConfig.intParams.find("prediction_error_feedback_enabled");
     if (predictionErrorFeedbackEnabledIt != irConfig.intParams.end()) {
@@ -2944,6 +4280,61 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
     if (predictionErrorFeedbackMinConfidenceIt != irConfig.doubleParams.end()) {
         config.predictionErrorFeedbackMinConfidence =
             std::clamp(predictionErrorFeedbackMinConfidenceIt->second, 0.0, 1.0);
+    }
+    const auto temporalSpikePredictionErrorFeedbackEnabledIt =
+        irConfig.intParams.find("temporal_spike_prediction_error_feedback_enabled");
+    if (temporalSpikePredictionErrorFeedbackEnabledIt != irConfig.intParams.end()) {
+        config.temporalSpikePredictionErrorFeedbackEnabled =
+            temporalSpikePredictionErrorFeedbackEnabledIt->second != 0;
+    }
+    const auto temporalSpikePredictionErrorFeedbackGainIt =
+        irConfig.doubleParams.find("temporal_spike_prediction_error_feedback_gain");
+    if (temporalSpikePredictionErrorFeedbackGainIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorFeedbackGain =
+            std::max(0.0, temporalSpikePredictionErrorFeedbackGainIt->second);
+    }
+    const auto temporalSpikePredictionErrorFeedbackThresholdIt =
+        irConfig.doubleParams.find("temporal_spike_prediction_error_feedback_threshold");
+    if (temporalSpikePredictionErrorFeedbackThresholdIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorFeedbackThreshold =
+            std::clamp(temporalSpikePredictionErrorFeedbackThresholdIt->second, 0.0, 1.0);
+    }
+    const auto temporalSpikePredictionErrorFeedbackMaxPenaltyIt =
+        irConfig.doubleParams.find("temporal_spike_prediction_error_feedback_max_penalty");
+    if (temporalSpikePredictionErrorFeedbackMaxPenaltyIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorFeedbackMaxPenalty =
+            std::clamp(temporalSpikePredictionErrorFeedbackMaxPenaltyIt->second, 0.0, 1.0);
+    }
+    const auto temporalSpikePredictionErrorPlasticityGainIt =
+        irConfig.doubleParams.find("temporal_spike_prediction_error_plasticity_gain");
+    if (temporalSpikePredictionErrorPlasticityGainIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorPlasticityGain =
+            std::max(0.0, temporalSpikePredictionErrorPlasticityGainIt->second);
+    }
+    const auto temporalSpikePredictionErrorReplayOnlyEnabledIt =
+        irConfig.intParams.find("temporal_spike_prediction_error_replay_only_enabled");
+    if (temporalSpikePredictionErrorReplayOnlyEnabledIt != irConfig.intParams.end()) {
+        config.temporalSpikePredictionErrorReplayOnlyEnabled =
+            temporalSpikePredictionErrorReplayOnlyEnabledIt->second != 0;
+    }
+    const auto temporalSpikePredictionErrorReplayGainIt =
+        irConfig.doubleParams.find("temporal_spike_prediction_error_replay_gain");
+    if (temporalSpikePredictionErrorReplayGainIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorReplayGain =
+            std::max(0.0, temporalSpikePredictionErrorReplayGainIt->second);
+    }
+    const auto temporalSpikePredictionErrorReplayThresholdIt =
+        irConfig.doubleParams.find("temporal_spike_prediction_error_replay_threshold");
+    if (temporalSpikePredictionErrorReplayThresholdIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorReplayThreshold =
+            std::clamp(temporalSpikePredictionErrorReplayThresholdIt->second, 0.0, 1.0);
+    }
+    const auto temporalSpikePredictionErrorReplayUncertaintyThresholdIt =
+        irConfig.doubleParams.find(
+            "temporal_spike_prediction_error_replay_uncertainty_threshold");
+    if (temporalSpikePredictionErrorReplayUncertaintyThresholdIt != irConfig.doubleParams.end()) {
+        config.temporalSpikePredictionErrorReplayUncertaintyThreshold =
+            std::clamp(temporalSpikePredictionErrorReplayUncertaintyThresholdIt->second, 0.0, 1.0);
     }
     const auto onlineRepeatsIt = irConfig.intParams.find("online_correction_repeats");
     if (onlineRepeatsIt != irConfig.intParams.end()) {
@@ -3395,17 +4786,47 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
         config.jepaRepresentationAuditEnabled =
             jepaRepresentationAuditEnabledIt->second != 0;
     }
+    const auto temporalSpikeCodeAuditEnabledIt =
+        irConfig.intParams.find("temporal_spike_code_audit_enabled");
+    if (temporalSpikeCodeAuditEnabledIt != irConfig.intParams.end()) {
+        config.temporalSpikeCodeAuditEnabled =
+            temporalSpikeCodeAuditEnabledIt->second != 0;
+    }
+    const auto temporalSpikeCodeProbeEnabledIt =
+        irConfig.intParams.find("temporal_spike_code_probe_enabled");
+    if (temporalSpikeCodeProbeEnabledIt != irConfig.intParams.end()) {
+        config.temporalSpikeCodeProbeEnabled =
+            temporalSpikeCodeProbeEnabledIt->second != 0;
+    }
+    const auto temporalSpikeCodeProbeTypeIt =
+        irConfig.stringParams.find("temporal_spike_code_probe_type");
+    if (temporalSpikeCodeProbeTypeIt != irConfig.stringParams.end()) {
+        config.temporalSpikeCodeProbeType =
+            trim(temporalSpikeCodeProbeTypeIt->second);
+    }
     const auto jepaRepresentationAuditSampleLimitIt =
         irConfig.intParams.find("jepa_representation_audit_sample_limit");
     if (jepaRepresentationAuditSampleLimitIt != irConfig.intParams.end()) {
         config.jepaRepresentationAuditSampleLimit =
             std::max(0, jepaRepresentationAuditSampleLimitIt->second);
     }
+    const auto temporalSpikeCodeAuditSampleLimitIt =
+        irConfig.intParams.find("temporal_spike_code_audit_sample_limit");
+    if (temporalSpikeCodeAuditSampleLimitIt != irConfig.intParams.end()) {
+        config.jepaRepresentationAuditSampleLimit =
+            std::max(0, temporalSpikeCodeAuditSampleLimitIt->second);
+    }
     const auto jepaRepresentationAuditOutputPathIt =
         irConfig.stringParams.find("jepa_representation_audit_output_path");
     if (jepaRepresentationAuditOutputPathIt != irConfig.stringParams.end()) {
         config.jepaRepresentationAuditOutputPath =
             trim(jepaRepresentationAuditOutputPathIt->second);
+    }
+    const auto temporalSpikeCodeAuditOutputPathIt =
+        irConfig.stringParams.find("temporal_spike_code_audit_output_path");
+    if (temporalSpikeCodeAuditOutputPathIt != irConfig.stringParams.end()) {
+        config.jepaRepresentationAuditOutputPath =
+            trim(temporalSpikeCodeAuditOutputPathIt->second);
     }
     const auto jepaDumpPathIt = irConfig.stringParams.find("jepa_dump_path");
     if (jepaDumpPathIt != irConfig.stringParams.end()) {
@@ -3499,13 +4920,25 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
             config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalFixation;
         } else if (value == "temporal_hemisphere_summary") {
             config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalHemisphereSummary;
+        } else if (value == "temporal_spike_code") {
+            config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalSpikeCode;
         } else {
             throw std::runtime_error("Unsupported jepa_target_mode: " + value);
         }
     }
+    const auto jepaBranchSubregionCountIt =
+        irConfig.intParams.find("jepa_branch_subregion_count");
+    if (jepaBranchSubregionCountIt != irConfig.intParams.end()) {
+        config.jepa.branchSubregionCount = std::max(1, jepaBranchSubregionCountIt->second);
+    }
     const auto jepaProbeModeIt = irConfig.stringParams.find("jepa_probe_mode");
     if (jepaProbeModeIt != irConfig.stringParams.end()) {
         config.jepa.probeMode = toLower(trim(jepaProbeModeIt->second));
+    }
+    const auto jepaProbeClassifierIt =
+        irConfig.stringParams.find("jepa_probe_classifier");
+    if (jepaProbeClassifierIt != irConfig.stringParams.end()) {
+        config.jepa.probeClassifier = toLower(trim(jepaProbeClassifierIt->second));
     }
     const auto jepaTrainerDumpPathIt =
         irConfig.stringParams.find("jepa_trainer_dump_path");
@@ -3538,6 +4971,23 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
     if (jepaVariancePenaltyIt != irConfig.doubleParams.end()) {
         config.jepa.variancePenalty = std::max(0.0, jepaVariancePenaltyIt->second);
     }
+    const auto jepaCovariancePenaltyIt =
+        irConfig.doubleParams.find("jepa_covariance_penalty");
+    if (jepaCovariancePenaltyIt != irConfig.doubleParams.end()) {
+        config.jepa.covariancePenalty = std::max(0.0, jepaCovariancePenaltyIt->second);
+    }
+    const auto jepaSuccessorDiscountIt =
+        irConfig.doubleParams.find("jepa_successor_discount");
+    if (jepaSuccessorDiscountIt != irConfig.doubleParams.end()) {
+        config.jepa.successorDiscount =
+            std::clamp(jepaSuccessorDiscountIt->second, 0.0, 1.0);
+    }
+    const auto jepaTemporalSpikeCodeDimIt =
+        irConfig.intParams.find("jepa_temporal_spike_code_dim");
+    if (jepaTemporalSpikeCodeDimIt != irConfig.intParams.end()) {
+        config.jepa.temporalSpikeCodeDim =
+            std::max(1, jepaTemporalSpikeCodeDimIt->second);
+    }
     const auto jepaMseLossWeightIt =
         irConfig.doubleParams.find("jepa_mse_loss_weight");
     if (jepaMseLossWeightIt != irConfig.doubleParams.end()) {
@@ -3563,6 +5013,11 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
     if (jepaProbeHiddenDimIt != irConfig.intParams.end()) {
         config.jepa.probeHiddenDim = std::max(1, jepaProbeHiddenDimIt->second);
     }
+    const auto jepaProbeKIt =
+        irConfig.intParams.find("jepa_probe_k");
+    if (jepaProbeKIt != irConfig.intParams.end()) {
+        config.jepa.probeK = std::max(1, jepaProbeKIt->second);
+    }
     const auto jepaProbeEpochsIt =
         irConfig.intParams.find("jepa_probe_epochs");
     if (jepaProbeEpochsIt != irConfig.intParams.end()) {
@@ -3572,6 +5027,11 @@ void applyClassificationConfig(const ClassificationConfigIR& irConfig, Config& c
         irConfig.doubleParams.find("jepa_probe_learning_rate");
     if (jepaProbeLearningRateIt != irConfig.doubleParams.end()) {
         config.jepa.probeLearningRate = std::max(0.0, jepaProbeLearningRateIt->second);
+    }
+    const auto jepaProbeExponentIt =
+        irConfig.doubleParams.find("jepa_probe_exponent");
+    if (jepaProbeExponentIt != irConfig.doubleParams.end()) {
+        config.jepa.probeExponent = std::max(0.0, jepaProbeExponentIt->second);
     }
     const auto focusAdjustmentEnabledIt = irConfig.intParams.find("focus_adjustment_enabled");
     if (focusAdjustmentEnabledIt != irConfig.intParams.end()) {
@@ -4003,6 +5463,9 @@ struct EvaluationResult {
     int fusionMissesWhenLeftWasRight = 0;
     int fusionMissesWhenRightWasRight = 0;
     int initialWrongBothHemispheresWrong = 0;
+    int corpusDisagreementArbiterUses = 0;
+    int corpusDisagreementArbiterCorrections = 0;
+    int corpusDisagreementArbiterRegressions = 0;
     int correctedFromOneHemisphereRight = 0;
     int correctedFromBothHemispheresWrong = 0;
     int correctionEvents = 0;
@@ -4013,6 +5476,25 @@ struct EvaluationResult {
     double replayEligibilityScaleSum = 0.0;
     double confusionClusterScoreSum = 0.0;
     int confusionClusterScoreSamples = 0;
+    int temporalSpikePredictionErrorSamples = 0;
+    int temporalSpikePredictionErrorCorrectSamples = 0;
+    int temporalSpikePredictionErrorIncorrectSamples = 0;
+    int temporalSpikePredictionErrorDecisionChanges = 0;
+    int temporalSpikePredictionErrorCorrections = 0;
+    int temporalSpikePredictionErrorRegressions = 0;
+    int temporalSpikePredictionErrorReplayGateSamples = 0;
+    int temporalSpikePredictionErrorReplayGateCorrectSamples = 0;
+    int temporalSpikePredictionErrorReplayGateIncorrectSamples = 0;
+    double temporalSpikePredictionErrorReplayBoostSum = 0.0;
+    double temporalSpikePredictionErrorSum = 0.0;
+    double temporalSpikePredictionErrorCorrectSum = 0.0;
+    double temporalSpikePredictionErrorIncorrectSum = 0.0;
+    double temporalSpikePredictionCosineSum = 0.0;
+    struct TemporalSpikePredictionErrorRecord {
+        double error = 0.0;
+        bool correct = false;
+    };
+    std::vector<TemporalSpikePredictionErrorRecord> temporalSpikePredictionErrorRecords;
     DoubleMatrix confusionClusterStrengths;
     struct SeparabilityStats {
         std::string name;
@@ -4737,6 +6219,24 @@ void recordHemisphereAgreement(EvaluationResult& result,
     }
 }
 
+void recordCorpusDisagreementArbiter(EvaluationResult& result,
+                                     const BilateralDecisionTrace& decision,
+                                     int truth) {
+    if (!decision.corpusDisagreementArbiterUsed) {
+        return;
+    }
+
+    result.corpusDisagreementArbiterUses++;
+    const bool originalCorrect =
+        decision.corpusDisagreementArbiterOriginalPredicted == truth;
+    const bool finalCorrect = decision.predicted == truth;
+    if (!originalCorrect && finalCorrect) {
+        result.corpusDisagreementArbiterCorrections++;
+    } else if (originalCorrect && !finalCorrect) {
+        result.corpusDisagreementArbiterRegressions++;
+    }
+}
+
 DecisionContext buildDecisionContext(const BilateralDecisionTrace& decision,
                                      const Config& config,
                                      const ConfusionClusterMemory* confusionMemory = nullptr) {
@@ -4768,13 +6268,36 @@ DecisionContext buildDecisionContext(const BilateralDecisionTrace& decision,
     if (confusionMemory != nullptr) {
         context.confusionCluster = computeConfusionClusterScore(*confusionMemory, decision);
     }
+    if (decision.temporalSpikePredictionErrorAvailable) {
+        context.temporalSpikePredictionError =
+            std::clamp(decision.temporalSpikePredictionError, 0.0, 1.0);
+    }
 
+    const double temporalPlasticityGain = config.temporalSpikePredictionErrorFeedbackEnabled
+        ? config.temporalSpikePredictionErrorPlasticityGain
+        : 0.0;
     context.plasticity = 1.0 +
         config.onlineContextUncertaintyGain * context.uncertainty +
-        config.onlineContextDisagreementGain * context.disagreement;
+        config.onlineContextDisagreementGain * context.disagreement +
+        temporalPlasticityGain * context.temporalSpikePredictionError;
     context.plasticity = std::clamp(context.plasticity, 0.5, 3.0);
+    if (config.temporalSpikePredictionErrorFeedbackEnabled) {
+        context.temporalSpikePredictionReplayBoost = context.temporalSpikePredictionError;
+    }
+    if (config.temporalSpikePredictionErrorReplayOnlyEnabled &&
+        decision.temporalSpikePredictionErrorAvailable &&
+        context.temporalSpikePredictionError >=
+            std::clamp(config.temporalSpikePredictionErrorReplayThreshold, 0.0, 1.0) &&
+        (context.uncertainty >=
+             std::clamp(config.temporalSpikePredictionErrorReplayUncertaintyThreshold, 0.0, 1.0) ||
+         context.disagreement > 0.0)) {
+        context.temporalSpikePredictionReplayBoost +=
+            std::max(0.0, config.temporalSpikePredictionErrorReplayGain) *
+            context.temporalSpikePredictionError;
+    }
     context.replayPriority = context.plasticity + context.uncertainty +
-                             0.5 * context.disagreement + context.confusionCluster;
+                             0.5 * context.disagreement + context.confusionCluster +
+                             context.temporalSpikePredictionReplayBoost;
     return context;
 }
 
@@ -4792,6 +6315,62 @@ void recordActiveInferenceUsage(EvaluationResult& result,
     }
     if (decision.fixationCount < std::max(1, config.activeInferenceFixations)) {
         result.activeInferenceEarlyStops++;
+    }
+}
+
+void recordTemporalSpikePredictionErrorDiagnostics(
+    EvaluationResult& result,
+    const std::optional<snnfw::jepa::JepaPredictionError>& predictionError,
+    int predictedBeforeFeedback,
+    int predictedAfterFeedback,
+    int truth) {
+    if (!predictionError.has_value() || !predictionError->available || truth < 0) {
+        return;
+    }
+
+    const bool correct = predictedAfterFeedback == truth;
+    const bool wasCorrect = predictedBeforeFeedback == truth;
+    const bool changed = predictedBeforeFeedback != predictedAfterFeedback;
+    const double error = std::clamp(predictionError->error, 0.0, 1.0);
+
+    result.temporalSpikePredictionErrorSamples++;
+    result.temporalSpikePredictionErrorSum += error;
+    result.temporalSpikePredictionCosineSum +=
+        std::clamp(predictionError->cosine, -1.0, 1.0);
+    result.temporalSpikePredictionErrorRecords.push_back({error, correct});
+    if (correct) {
+        result.temporalSpikePredictionErrorCorrectSamples++;
+        result.temporalSpikePredictionErrorCorrectSum += error;
+    } else {
+        result.temporalSpikePredictionErrorIncorrectSamples++;
+        result.temporalSpikePredictionErrorIncorrectSum += error;
+    }
+
+    if (!changed) {
+        return;
+    }
+    result.temporalSpikePredictionErrorDecisionChanges++;
+    if (!wasCorrect && correct) {
+        result.temporalSpikePredictionErrorCorrections++;
+    } else if (wasCorrect && !correct) {
+        result.temporalSpikePredictionErrorRegressions++;
+    }
+}
+
+void recordTemporalSpikePredictionReplayGate(EvaluationResult& result,
+                                             const DecisionContext& context,
+                                             int predicted,
+                                             int truth) {
+    if (context.temporalSpikePredictionReplayBoost <= 0.0 || truth < 0 || predicted < 0) {
+        return;
+    }
+    result.temporalSpikePredictionErrorReplayGateSamples++;
+    result.temporalSpikePredictionErrorReplayBoostSum +=
+        context.temporalSpikePredictionReplayBoost;
+    if (predicted == truth) {
+        result.temporalSpikePredictionErrorReplayGateCorrectSamples++;
+    } else {
+        result.temporalSpikePredictionErrorReplayGateIncorrectSamples++;
     }
 }
 
@@ -5408,7 +6987,11 @@ std::vector<double> buildFusionPatternFromTraces(const std::vector<HemisphereDec
     std::string mode = config.fusionFeatureMode;
     std::transform(mode.begin(), mode.end(), mode.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (mode == "interaction") {
+    if (mode == "hemisphere_concat") {
+        fusionPattern = buildHemisphereConcatPatternFromTraces(traces);
+    } else if (mode == "confidence_concat") {
+        fusionPattern = buildConfidenceConcatPatternFromTraces(traces);
+    } else if (mode == "interaction") {
         for (size_t a = 0; a < confidences.size(); ++a) {
             for (size_t b = a + 1; b < confidences.size(); ++b) {
                 const size_t dim = std::min(confidences[a].size(), confidences[b].size());
@@ -6087,6 +7670,63 @@ BilateralDecisionTrace buildCorpusCallosumDecisionFromTraces(
     trace.topHypotheses = collectTopHypotheses(trace.combinedConfidence, onlineTraceTopK(config));
     if (!trace.topHypotheses.empty()) {
         trace.predicted = trace.topHypotheses.front().label;
+    }
+    if (config.corpusDisagreementArbiterEnabled && trace.hemisphereTraces.size() >= 2 &&
+        !trace.combinedConfidence.empty()) {
+        bool disagreement = false;
+        int validVotes = 0;
+        int previousPredicted = -1;
+        size_t selectedHemisphere = trace.hemisphereTraces.size();
+        double bestMargin = -std::numeric_limits<double>::infinity();
+        double secondMargin = -std::numeric_limits<double>::infinity();
+
+        for (size_t hemisphereIndex = 0; hemisphereIndex < trace.hemisphereTraces.size(); ++hemisphereIndex) {
+            const auto& hemisphereTrace = trace.hemisphereTraces[hemisphereIndex];
+            if (hemisphereTrace.predicted < 0 || hemisphereTrace.predicted >= config.numClasses) {
+                continue;
+            }
+            ++validVotes;
+            if (previousPredicted >= 0 && hemisphereTrace.predicted != previousPredicted) {
+                disagreement = true;
+            }
+            previousPredicted = hemisphereTrace.predicted;
+
+            if (hemisphereTrace.margin > bestMargin) {
+                secondMargin = bestMargin;
+                bestMargin = hemisphereTrace.margin;
+                selectedHemisphere = hemisphereIndex;
+            } else if (hemisphereTrace.margin > secondMargin) {
+                secondMargin = hemisphereTrace.margin;
+            }
+        }
+
+        if (disagreement && validVotes >= 2 &&
+            selectedHemisphere < trace.hemisphereTraces.size()) {
+            const auto& selectedTrace = trace.hemisphereTraces[selectedHemisphere];
+            const int selectedLabel = selectedTrace.predicted;
+            const double marginDelta = bestMargin - std::max(0.0, secondMargin);
+            if (selectedLabel >= 0 &&
+                static_cast<size_t>(selectedLabel) < trace.combinedConfidence.size() &&
+                selectedLabel != trace.predicted &&
+                bestMargin >= config.corpusDisagreementArbiterMinMargin &&
+                marginDelta >= config.corpusDisagreementArbiterMarginDelta) {
+                const double currentBest = trace.topHypotheses.empty()
+                    ? 0.0
+                    : trace.topHypotheses.front().score;
+                trace.corpusDisagreementArbiterUsed = true;
+                trace.corpusDisagreementArbiterOriginalPredicted = trace.predicted;
+                trace.corpusDisagreementArbiterSelectedHemisphere =
+                    static_cast<int>(selectedHemisphere);
+                trace.combinedConfidence[static_cast<size_t>(selectedLabel)] =
+                    std::max(trace.combinedConfidence[static_cast<size_t>(selectedLabel)],
+                             currentBest + 1e-6);
+                normalizeSum(trace.combinedConfidence);
+                trace.topHypotheses =
+                    collectTopHypotheses(trace.combinedConfidence, onlineTraceTopK(config));
+                trace.predicted =
+                    trace.topHypotheses.empty() ? selectedLabel : trace.topHypotheses.front().label;
+            }
+        }
     }
     return trace;
 }
@@ -6823,6 +8463,7 @@ EvaluationResult evaluateCorpusCallosumPatterns(std::vector<HemisphereRuntime>& 
                                                 const Config& config,
                                                 SeparabilityDiagnosticsRuntime* separabilityRuntime,
                                                 FlowAuditRuntime* flowAuditRuntime,
+                                                const snnfw::jepa::JepaModel* temporalPredictionModel,
                                                 const std::string& label) {
     EvaluationResult result = makeEvaluationResult(config);
     if (separabilityRuntime != nullptr) {
@@ -7091,6 +8732,7 @@ EvaluationResult evaluateCorpusCallosumPatterns(std::vector<HemisphereRuntime>& 
         const int rightInitialPredicted =
             decision.hemisphereTraces.size() > 1 ? decision.hemisphereTraces[1].predicted : -1;
         recordHemisphereAgreement(result, decision, truth);
+        recordCorpusDisagreementArbiter(result, decision, truth);
         if (separabilityRuntime != nullptr) {
             recordSeparabilityDiagnostics(
                 result, *separabilityRuntime, hemispheres, decision, truth);
@@ -7104,6 +8746,15 @@ EvaluationResult evaluateCorpusCallosumPatterns(std::vector<HemisphereRuntime>& 
             [&](const VisualStimulus& focusedImage) {
                 return inferCorpusCallosumDecision(hemispheres, focusedImage, config);
             });
+        const int predictedBeforeTemporalFeedback = decision.predicted;
+        const auto temporalPredictionError = computeTemporalSpikePredictionError(
+            hemispheres, loader, index, config, temporalPredictionModel);
+        applyTemporalSpikePredictionErrorFeedback(decision, temporalPredictionError, config);
+        recordTemporalSpikePredictionErrorDiagnostics(result,
+                                                      temporalPredictionError,
+                                                      predictedBeforeTemporalFeedback,
+                                                      decision.predicted,
+                                                      truth);
         recordActiveInferenceUsage(result, decision, config);
         const size_t sampleOrdinal = records.size() + 1;
         const bool storeFlowAuditRows =
@@ -7155,6 +8806,7 @@ EvaluationResult evaluateCorpusCallosumPatterns(std::vector<HemisphereRuntime>& 
         const auto context = buildDecisionContext(decision, config, &confusionMemory);
         result.confusionClusterScoreSum += context.confusionCluster;
         result.confusionClusterScoreSamples++;
+        recordTemporalSpikePredictionReplayGate(result, context, decision.predicted, truth);
 
         if (useOnlineCorrection(config)) {
             if (initialPredicted == truth) {
@@ -7844,6 +9496,19 @@ bool useRecurrentObjectStateReadout(const Config& config) {
            config.recurrentObjectStateReadoutEnabled &&
            config.recurrentObjectStateUnitsPerClass > 0 &&
            config.recurrentObjectStateCycles > 0;
+}
+
+bool hasClassifierSidePromotionStage(const Config& config) {
+    return useHemisphereTopographicStage(config) ||
+           useHemisphereConvergentCode(config) ||
+           useFigureGroundMask(config) ||
+           useFigureGroundClassifier(config);
+}
+
+bool promotedTapSurfaceAliasesRawStage1(const Config& config) {
+    return config.jepa.tapSurface == snnfw::jepa::TapSurface::PromotedStage1 &&
+           !useRecurrentSensoryState(config) &&
+           !hasClassifierSidePromotionStage(config);
 }
 
 std::vector<size_t> inferHemisphereBranchPatternSizes(
@@ -10648,6 +12313,7 @@ EvaluationResult evaluateBilateralPatterns(std::vector<HemisphereRuntime>& hemis
                                            FusionRuntime& fusionRuntime,
                                            SeparabilityDiagnosticsRuntime* separabilityRuntime,
                                            FlowAuditRuntime* flowAuditRuntime,
+                                           const snnfw::jepa::JepaModel* temporalPredictionModel,
                                            const std::string& label) {
     EvaluationResult result = makeEvaluationResult(config);
     if (separabilityRuntime != nullptr) {
@@ -10990,6 +12656,7 @@ EvaluationResult evaluateBilateralPatterns(std::vector<HemisphereRuntime>& hemis
         const int rightInitialPredicted =
             decision.hemisphereTraces.size() > 1 ? decision.hemisphereTraces[1].predicted : -1;
         recordHemisphereAgreement(result, decision, truth);
+        recordCorpusDisagreementArbiter(result, decision, truth);
         if (separabilityRuntime != nullptr) {
             recordSeparabilityDiagnostics(
                 result, *separabilityRuntime, hemispheres, decision, truth);
@@ -11004,6 +12671,15 @@ EvaluationResult evaluateBilateralPatterns(std::vector<HemisphereRuntime>& hemis
                 return inferFusionDecision(
                     hemispheres, focusedImage, config, fusionClassifier, fusionRuntime);
             });
+        const int predictedBeforeTemporalFeedback = decision.predicted;
+        const auto temporalPredictionError = computeTemporalSpikePredictionError(
+            hemispheres, loader, index, config, temporalPredictionModel);
+        applyTemporalSpikePredictionErrorFeedback(decision, temporalPredictionError, config);
+        recordTemporalSpikePredictionErrorDiagnostics(result,
+                                                      temporalPredictionError,
+                                                      predictedBeforeTemporalFeedback,
+                                                      decision.predicted,
+                                                      truth);
         recordActiveInferenceUsage(result, decision, config);
         const size_t sampleOrdinal = records.size() + 1;
         const bool storeFlowAuditRows =
@@ -11054,6 +12730,7 @@ EvaluationResult evaluateBilateralPatterns(std::vector<HemisphereRuntime>& hemis
         const auto context = buildDecisionContext(decision, config, &confusionMemory);
         result.confusionClusterScoreSum += context.confusionCluster;
         result.confusionClusterScoreSamples++;
+        recordTemporalSpikePredictionReplayGate(result, context, decision.predicted, truth);
 
         if (useOnlineCorrection(config)) {
             if (initialPredicted == truth) {
@@ -12014,6 +13691,15 @@ void printBilateralAttributionSummary(const EvaluationResult& result, const Conf
                   << result.correctedFromBothHemispheresWrong << std::endl;
     }
 
+    if (result.corpusDisagreementArbiterUses > 0) {
+        std::cout << "  Corpus disagreement arbiter: uses="
+                  << result.corpusDisagreementArbiterUses
+                  << ", corrections="
+                  << result.corpusDisagreementArbiterCorrections
+                  << ", regressions="
+                  << result.corpusDisagreementArbiterRegressions << std::endl;
+    }
+
     printTopDirectedPairs(result.correctedInitialPairs, "Top corrected initial pairs", 5, config);
     printTopDirectedPairs(result.unresolvedInitialPairs, "Top unresolved initial pairs", 5, config);
 
@@ -12070,6 +13756,121 @@ void printFocusAdjustmentSummary(const EvaluationResult& result) {
               << ", left=" << result.focusLeftSelections
               << ", center=" << result.focusCenterSelections
               << ", right=" << result.focusRightSelections << std::endl;
+}
+
+void printTemporalSpikePredictionErrorSummary(const EvaluationResult& result) {
+    if (result.temporalSpikePredictionErrorSamples <= 0) {
+        return;
+    }
+
+    const double samples =
+        static_cast<double>(std::max(1, result.temporalSpikePredictionErrorSamples));
+    const double correctSamples =
+        static_cast<double>(std::max(1, result.temporalSpikePredictionErrorCorrectSamples));
+    const double incorrectSamples =
+        static_cast<double>(std::max(1, result.temporalSpikePredictionErrorIncorrectSamples));
+    const double meanError = result.temporalSpikePredictionErrorSum / samples;
+    const double correctError =
+        result.temporalSpikePredictionErrorCorrectSum / correctSamples;
+    const double incorrectError =
+        result.temporalSpikePredictionErrorIncorrectSum / incorrectSamples;
+    const double meanCosine = result.temporalSpikePredictionCosineSum / samples;
+
+    std::cout << "  Temporal spike prediction error: samples="
+              << result.temporalSpikePredictionErrorSamples
+              << ", mean_error=" << std::fixed << std::setprecision(4) << meanError
+              << ", correct_error=" << correctError
+              << ", incorrect_error=" << incorrectError
+              << ", mean_cosine=" << meanCosine << std::endl;
+
+    if (result.temporalSpikePredictionErrorDecisionChanges > 0) {
+        std::cout << "  Temporal prediction feedback changes: "
+                  << result.temporalSpikePredictionErrorDecisionChanges
+                  << ", corrections=" << result.temporalSpikePredictionErrorCorrections
+                  << ", regressions=" << result.temporalSpikePredictionErrorRegressions
+                  << std::endl;
+    }
+    if (result.temporalSpikePredictionErrorReplayGateSamples > 0) {
+        const double meanBoost =
+            result.temporalSpikePredictionErrorReplayBoostSum /
+            static_cast<double>(std::max(1, result.temporalSpikePredictionErrorReplayGateSamples));
+        std::cout << "  Temporal prediction replay gate: samples="
+                  << result.temporalSpikePredictionErrorReplayGateSamples
+                  << ", correct=" << result.temporalSpikePredictionErrorReplayGateCorrectSamples
+                  << ", incorrect="
+                  << result.temporalSpikePredictionErrorReplayGateIncorrectSamples
+                  << ", mean_boost=" << std::fixed << std::setprecision(4)
+                  << meanBoost << std::endl;
+    }
+
+    const int totalCorrect = result.temporalSpikePredictionErrorCorrectSamples;
+    const int totalIncorrect = result.temporalSpikePredictionErrorIncorrectSamples;
+    if (totalCorrect <= 0 || totalIncorrect <= 0 ||
+        result.temporalSpikePredictionErrorRecords.empty()) {
+        return;
+    }
+
+    struct ThresholdCandidate {
+        double threshold = 0.0;
+        double balancedAccuracy = 0.0;
+        double wrongPrecision = 0.0;
+        double wrongRecall = 0.0;
+        int flagged = 0;
+    };
+
+    std::vector<double> thresholds;
+    thresholds.reserve(result.temporalSpikePredictionErrorRecords.size() + 2);
+    thresholds.push_back(0.0);
+    thresholds.push_back(1.0);
+    for (const auto& record : result.temporalSpikePredictionErrorRecords) {
+        thresholds.push_back(std::clamp(record.error, 0.0, 1.0));
+    }
+    std::sort(thresholds.begin(), thresholds.end());
+    thresholds.erase(std::unique(thresholds.begin(),
+                                 thresholds.end(),
+                                 [](double lhs, double rhs) {
+                                     return std::abs(lhs - rhs) < 1e-6;
+                                 }),
+                     thresholds.end());
+
+    ThresholdCandidate best;
+    for (double threshold : thresholds) {
+        int trueWrong = 0;
+        int falseWrong = 0;
+        int trueCorrect = 0;
+        for (const auto& record : result.temporalSpikePredictionErrorRecords) {
+            const bool predictsWrong = record.error >= threshold;
+            if (predictsWrong && !record.correct) {
+                trueWrong++;
+            } else if (predictsWrong && record.correct) {
+                falseWrong++;
+            } else if (!predictsWrong && record.correct) {
+                trueCorrect++;
+            }
+        }
+
+        const int flagged = trueWrong + falseWrong;
+        const double wrongRecall =
+            static_cast<double>(trueWrong) / static_cast<double>(std::max(1, totalIncorrect));
+        const double correctRecall =
+            static_cast<double>(trueCorrect) / static_cast<double>(std::max(1, totalCorrect));
+        const double balancedAccuracy = 0.5 * (wrongRecall + correctRecall);
+        const double wrongPrecision =
+            static_cast<double>(trueWrong) / static_cast<double>(std::max(1, flagged));
+        if (balancedAccuracy > best.balancedAccuracy ||
+            (std::abs(balancedAccuracy - best.balancedAccuracy) < 1e-9 &&
+             wrongPrecision > best.wrongPrecision)) {
+            best = {threshold, balancedAccuracy, wrongPrecision, wrongRecall, flagged};
+        }
+    }
+
+    std::cout << "  Temporal error gate calibration: threshold=" << std::fixed
+              << std::setprecision(4) << best.threshold
+              << ", balanced_acc=" << (100.0 * best.balancedAccuracy) << "%"
+              << ", wrong_precision=" << (100.0 * best.wrongPrecision) << "%"
+              << ", wrong_recall=" << (100.0 * best.wrongRecall) << "%"
+              << ", flagged=" << best.flagged << "/"
+              << result.temporalSpikePredictionErrorSamples << std::endl;
 }
 
 void printActiveInferenceSummary(const EvaluationResult& result, const Config& config) {
@@ -12256,6 +14057,48 @@ Config parseArgs(int argc, char* argv[]) {
             applyRetinaStringOverride("encoding_strategy", config.encodingStrategy);
         } else if (arg == "--classifier" && i + 1 < argc) {
             config.classifier = argv[++i];
+        } else if (arg == "--fusion-feature-mode" && i + 1 < argc) {
+            config.fusionFeatureMode = toLower(trim(argv[++i]));
+        } else if (arg == "--jepa-probe-classifier" && i + 1 < argc) {
+            config.jepa.probeClassifier = toLower(trim(argv[++i]));
+        } else if (arg == "--jepa-trainer-disabled") {
+            config.jepa.trainerEnabled = false;
+        } else if (arg == "--jepa-probe-disabled") {
+            config.jepa.probeEnabled = false;
+        } else if (arg == "--jepa-probe-k" && i + 1 < argc) {
+            config.jepa.probeK = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--jepa-probe-exponent" && i + 1 < argc) {
+            config.jepa.probeExponent = std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--jepa-projection-dim" && i + 1 < argc) {
+            config.jepa.projectionDim = std::max(1, std::atoi(argv[++i]));
+        } else if (arg == "--jepa-trainer-epochs" && i + 1 < argc) {
+            config.jepa.trainerEpochs = std::max(0, std::atoi(argv[++i]));
+        } else if (arg == "--jepa-trainer-learning-rate" && i + 1 < argc) {
+            config.jepa.trainerLearningRate = std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--jepa-variance-floor" && i + 1 < argc) {
+            config.jepa.varianceFloor = std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--jepa-variance-penalty" && i + 1 < argc) {
+            config.jepa.variancePenalty = std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--jepa-covariance-penalty" && i + 1 < argc) {
+            config.jepa.covariancePenalty = std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--jepa-successor-discount" && i + 1 < argc) {
+            config.jepa.successorDiscount =
+                std::clamp(std::atof(argv[++i]), 0.0, 1.0);
+        } else if (arg == "--jepa-target-mode" && i + 1 < argc) {
+            const std::string value = toLower(trim(argv[++i]));
+            if (value == "branch_mask") {
+                config.jepa.targetMode = snnfw::jepa::TargetMode::BranchMask;
+            } else if (value == "temporal_fixation") {
+                config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalFixation;
+            } else if (value == "temporal_hemisphere_summary") {
+                config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalHemisphereSummary;
+            } else if (value == "temporal_spike_code") {
+                config.jepa.targetMode = snnfw::jepa::TargetMode::TemporalSpikeCode;
+            } else {
+                throw std::runtime_error("Unsupported --jepa-target-mode: " + value);
+            }
+        } else if (arg == "--jepa-temporal-spike-code-dim" && i + 1 < argc) {
+            config.jepa.temporalSpikeCodeDim = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--activation-mode" && i + 1 < argc) {
             config.activationMode = argv[++i];
             applyRetinaStringOverride("activation_mode", config.activationMode);
@@ -12355,6 +14198,14 @@ Config parseArgs(int argc, char* argv[]) {
             config.onlineContextDisagreementGain = std::atof(argv[++i]);
         } else if (arg == "--corpus-disagreement-gain" && i + 1 < argc) {
             config.corpusDisagreementGain = std::atof(argv[++i]);
+        } else if (arg == "--corpus-disagreement-arbiter-enabled") {
+            config.corpusDisagreementArbiterEnabled = true;
+        } else if (arg == "--corpus-disagreement-arbiter-min-margin" && i + 1 < argc) {
+            config.corpusDisagreementArbiterMinMargin =
+                std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--corpus-disagreement-arbiter-margin-delta" && i + 1 < argc) {
+            config.corpusDisagreementArbiterMarginDelta =
+                std::max(0.0, std::atof(argv[++i]));
         } else if (arg == "--prediction-error-feedback-enabled") {
             config.predictionErrorFeedbackEnabled = true;
         } else if (arg == "--prediction-error-feedback-gain" && i + 1 < argc) {
@@ -12367,6 +14218,32 @@ Config parseArgs(int argc, char* argv[]) {
                 std::clamp(std::atof(argv[++i]), 0.0, 1.0);
         } else if (arg == "--prediction-error-feedback-min-confidence" && i + 1 < argc) {
             config.predictionErrorFeedbackMinConfidence =
+                std::clamp(std::atof(argv[++i]), 0.0, 1.0);
+        } else if (arg == "--temporal-spike-prediction-error-feedback-enabled") {
+            config.temporalSpikePredictionErrorFeedbackEnabled = true;
+        } else if (arg == "--temporal-spike-prediction-error-feedback-gain" && i + 1 < argc) {
+            config.temporalSpikePredictionErrorFeedbackGain =
+                std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--temporal-spike-prediction-error-feedback-threshold" && i + 1 < argc) {
+            config.temporalSpikePredictionErrorFeedbackThreshold =
+                std::clamp(std::atof(argv[++i]), 0.0, 1.0);
+        } else if (arg == "--temporal-spike-prediction-error-feedback-max-penalty" && i + 1 < argc) {
+            config.temporalSpikePredictionErrorFeedbackMaxPenalty =
+                std::clamp(std::atof(argv[++i]), 0.0, 1.0);
+        } else if (arg == "--temporal-spike-prediction-error-plasticity-gain" && i + 1 < argc) {
+            config.temporalSpikePredictionErrorPlasticityGain =
+                std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--temporal-spike-prediction-error-replay-only-enabled") {
+            config.temporalSpikePredictionErrorReplayOnlyEnabled = true;
+        } else if (arg == "--temporal-spike-prediction-error-replay-gain" && i + 1 < argc) {
+            config.temporalSpikePredictionErrorReplayGain =
+                std::max(0.0, std::atof(argv[++i]));
+        } else if (arg == "--temporal-spike-prediction-error-replay-threshold" && i + 1 < argc) {
+            config.temporalSpikePredictionErrorReplayThreshold =
+                std::clamp(std::atof(argv[++i]), 0.0, 1.0);
+        } else if (arg == "--temporal-spike-prediction-error-replay-uncertainty-threshold" &&
+                   i + 1 < argc) {
+            config.temporalSpikePredictionErrorReplayUncertaintyThreshold =
                 std::clamp(std::atof(argv[++i]), 0.0, 1.0);
         } else if (arg == "--hemisphere-convergent-code-enabled") {
             config.hemisphereConvergentCodeEnabled = true;
@@ -12537,10 +14414,25 @@ Config parseArgs(int argc, char* argv[]) {
             config.flowAuditOutputPrefix = argv[++i];
         } else if (arg == "--jepa-representation-audit-enabled") {
             config.jepaRepresentationAuditEnabled = true;
+        } else if (arg == "--temporal-spike-code-audit-enabled") {
+            config.temporalSpikeCodeAuditEnabled = true;
+        } else if (arg == "--temporal-spike-code-probe-enabled") {
+            config.temporalSpikeCodeProbeEnabled = true;
+        } else if (arg == "--temporal-spike-code-probe-type" && i + 1 < argc) {
+            config.temporalSpikeCodeProbeEnabled = true;
+            config.temporalSpikeCodeProbeType = argv[++i];
         } else if (arg == "--jepa-representation-audit-sample-limit" && i + 1 < argc) {
+            config.jepaRepresentationAuditSampleLimit = std::max(0, std::atoi(argv[++i]));
+        } else if (arg == "--temporal-spike-code-audit-sample-limit" && i + 1 < argc) {
+            config.temporalSpikeCodeAuditEnabled = true;
             config.jepaRepresentationAuditSampleLimit = std::max(0, std::atoi(argv[++i]));
         } else if (arg == "--jepa-representation-audit-output-path" && i + 1 < argc) {
             config.jepaRepresentationAuditOutputPath = argv[++i];
+        } else if (arg == "--temporal-spike-code-audit-output-path" && i + 1 < argc) {
+            config.temporalSpikeCodeAuditEnabled = true;
+            config.jepaRepresentationAuditOutputPath = argv[++i];
+        } else if (arg == "--jepa-branch-subregion-count" && i + 1 < argc) {
+            config.jepa.branchSubregionCount = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--use-features") {
             config.useFeatures = true;
         } else if (arg == "--use-activations") {
@@ -12571,6 +14463,19 @@ Config parseArgs(int argc, char* argv[]) {
                 << "  --edge-operator sobel|gabor|quadrature_gabor|orientation_energy|dog\n"
                 << "  --encoding-strategy rate|temporal|population\n"
                 << "  --classifier majority|weighted_similarity|weighted_distance|hierarchical\n"
+                << "  --fusion-feature-mode interaction|confidence_concat|hemisphere_concat\n"
+                << "  --jepa-probe-classifier majority|weighted_similarity|weighted_distance|hierarchical\n"
+                << "  --jepa-trainer-disabled\n"
+                << "  --jepa-probe-disabled\n"
+                << "  --jepa-probe-k <n>\n"
+                << "  --jepa-probe-exponent <v>\n"
+                << "  --jepa-projection-dim <n>\n"
+                << "  --jepa-trainer-epochs <n>\n"
+                << "  --jepa-trainer-learning-rate <v>\n"
+                << "  --jepa-variance-floor <v>\n"
+                << "  --jepa-variance-penalty <v>\n"
+                << "  --jepa-target-mode branch_mask|temporal_fixation|temporal_hemisphere_summary|temporal_spike_code\n"
+                << "  --jepa-temporal-spike-code-dim <n>\n"
                 << "  --activation-mode binary|similarity|hybrid\n"
                 << "  --hierarchical-groups <l1,l2;...>\n"
                 << "  --hierarchical-coarse-strategy majority|weighted_similarity|weighted_distance\n"
@@ -12618,11 +14523,23 @@ Config parseArgs(int argc, char* argv[]) {
                 << "  --online-context-uncertainty-gain <v>\n"
                 << "  --online-context-disagreement-gain <v>\n"
                 << "  --corpus-disagreement-gain <v>\n"
+                << "  --corpus-disagreement-arbiter-enabled\n"
+                << "  --corpus-disagreement-arbiter-min-margin <v>\n"
+                << "  --corpus-disagreement-arbiter-margin-delta <v>\n"
                 << "  --prediction-error-feedback-enabled\n"
                 << "  --prediction-error-feedback-gain <v>\n"
                 << "  --prediction-error-feedback-threshold <v>\n"
                 << "  --prediction-error-feedback-max-penalty <v>\n"
                 << "  --prediction-error-feedback-min-confidence <v>\n"
+                << "  --temporal-spike-prediction-error-feedback-enabled\n"
+                << "  --temporal-spike-prediction-error-feedback-gain <v>\n"
+                << "  --temporal-spike-prediction-error-feedback-threshold <v>\n"
+                << "  --temporal-spike-prediction-error-feedback-max-penalty <v>\n"
+                << "  --temporal-spike-prediction-error-plasticity-gain <v>\n"
+                << "  --temporal-spike-prediction-error-replay-only-enabled\n"
+                << "  --temporal-spike-prediction-error-replay-gain <v>\n"
+                << "  --temporal-spike-prediction-error-replay-threshold <v>\n"
+                << "  --temporal-spike-prediction-error-replay-uncertainty-threshold <v>\n"
                 << "  --hemisphere-convergent-code-enabled\n"
                 << "  --hemisphere-convergent-summary-bins <n>\n"
                 << "  --hemisphere-convergent-residual-gain <v>\n"
@@ -12687,6 +14604,12 @@ Config parseArgs(int argc, char* argv[]) {
                 << "  --jepa-representation-audit-enabled\n"
                 << "  --jepa-representation-audit-sample-limit <n>\n"
                 << "  --jepa-representation-audit-output-path <path>\n"
+                << "  --temporal-spike-code-audit-enabled\n"
+                << "  --temporal-spike-code-probe-enabled\n"
+                << "  --temporal-spike-code-probe-type <discounted_trace|first_spike_rank|temporal_delta|temporal_onset_sustained_projected|temporal_onset_sustained_rich_projected>\n"
+                << "  --temporal-spike-code-audit-sample-limit <n>\n"
+                << "  --temporal-spike-code-audit-output-path <path>\n"
+                << "  --jepa-branch-subregion-count <n>\n"
                 << "  --focus-groups <A,B;C,D;...>\n"
                 << "  --focus-limit-per-label <n>\n"
                 << "  --focus-only\n"
@@ -12703,6 +14626,10 @@ Config parseArgs(int argc, char* argv[]) {
     }
     if (config.focusOnly && config.focusGroups.empty() && config.focusGroupSpec.empty()) {
         throw std::runtime_error("--focus-only requires --focus-groups");
+    }
+    if (config.temporalSpikeCodeAuditEnabled && !config.jepaRepresentationAuditEnabled) {
+        config.jepa.trainerEnabled = false;
+        config.jepa.probeEnabled = false;
     }
 
     return config;
@@ -12738,6 +14665,7 @@ int main(int argc, char* argv[]) {
                       << ", visible_branches=" << config.jepa.visibleBranchCount
                       << ", hidden_branches=" << config.jepa.hiddenBranchCount
                       << ", max_samples=" << config.jepa.maxSamples
+                      << ", branch_subregions=" << config.jepa.branchSubregionCount
                       << ", branch_tokens="
                       << (config.jepa.includeBranchTokens ? "on" : "off")
                       << ", hemisphere_token="
@@ -12757,6 +14685,9 @@ int main(int argc, char* argv[]) {
                       << ", cosine_weight=" << config.jepa.cosineLossWeight
                       << ", variance_floor=" << config.jepa.varianceFloor
                       << ", variance_penalty=" << config.jepa.variancePenalty
+                      << ", covariance_penalty=" << config.jepa.covariancePenalty
+                      << ", successor_discount=" << config.jepa.successorDiscount
+                      << ", temporal_spike_code_dim=" << config.jepa.temporalSpikeCodeDim
                       << ", metadata=" << (config.jepa.encodeViewMetadata ? "on" : "off")
                       << ", metadata_scale=" << config.jepa.metadataScale
                       << ", path=" << trainerPath << ")"
@@ -12769,11 +14700,21 @@ int main(int argc, char* argv[]) {
                     std::cout << ", hidden_dim=" << config.jepa.probeHiddenDim
                               << ", epochs=" << config.jepa.probeEpochs
                               << ", lr=" << config.jepa.probeLearningRate;
+                } else {
+                    std::cout << ", classifier=" << config.jepa.probeClassifier
+                              << ", k=" << config.jepa.probeK
+                              << ", exponent=" << config.jepa.probeExponent;
                 }
                 std::cout << ")";
             }
             std::cout
                       << std::endl;
+            if (promotedTapSurfaceAliasesRawStage1(config)) {
+                std::cout
+                    << "  JEPA note: promoted_stage1 currently aliases raw_stage1 because no "
+                       "classifier-side promotion stage or recurrent sensory stage is enabled"
+                    << std::endl;
+            }
         }
         for (const auto& retinaConfig : retinaConfigs) {
             std::cout << "    - " << retinaConfig.name
@@ -12824,6 +14765,12 @@ int main(int argc, char* argv[]) {
                       << ", corpus_centroid_gain=" << config.corpusCentroidGain
                       << ", corpus_neighbor_gain=" << config.corpusNeighborGain
                       << ", corpus_disagreement_gain=" << config.corpusDisagreementGain
+                      << ", corpus_disagreement_arbiter="
+                      << (config.corpusDisagreementArbiterEnabled ? "on" : "off")
+                      << ", corpus_disagreement_arbiter_min_margin="
+                      << config.corpusDisagreementArbiterMinMargin
+                      << ", corpus_disagreement_arbiter_margin_delta="
+                      << config.corpusDisagreementArbiterMarginDelta
                       << ", prediction_error_feedback="
                       << (config.predictionErrorFeedbackEnabled ? "on" : "off")
                       << ", prediction_error_feedback_gain="
@@ -12834,6 +14781,24 @@ int main(int argc, char* argv[]) {
                       << config.predictionErrorFeedbackMaxPenalty
                       << ", prediction_error_feedback_min_confidence="
                       << config.predictionErrorFeedbackMinConfidence
+                      << ", temporal_spike_prediction_error_feedback="
+                      << (config.temporalSpikePredictionErrorFeedbackEnabled ? "on" : "off")
+                      << ", temporal_spike_prediction_error_feedback_gain="
+                      << config.temporalSpikePredictionErrorFeedbackGain
+                      << ", temporal_spike_prediction_error_feedback_threshold="
+                      << config.temporalSpikePredictionErrorFeedbackThreshold
+                      << ", temporal_spike_prediction_error_feedback_max_penalty="
+                      << config.temporalSpikePredictionErrorFeedbackMaxPenalty
+                      << ", temporal_spike_prediction_error_plasticity_gain="
+                      << config.temporalSpikePredictionErrorPlasticityGain
+                      << ", temporal_spike_prediction_error_replay_only="
+                      << (config.temporalSpikePredictionErrorReplayOnlyEnabled ? "on" : "off")
+                      << ", temporal_spike_prediction_error_replay_gain="
+                      << config.temporalSpikePredictionErrorReplayGain
+                      << ", temporal_spike_prediction_error_replay_threshold="
+                      << config.temporalSpikePredictionErrorReplayThreshold
+                      << ", temporal_spike_prediction_error_replay_uncertainty="
+                      << config.temporalSpikePredictionErrorReplayUncertaintyThreshold
                       << ", hemisphere_convergent_code="
                       << (config.hemisphereConvergentCodeEnabled ? "on" : "off")
                       << ", hemisphere_convergent_summary_bins="
@@ -13002,6 +14967,12 @@ int main(int argc, char* argv[]) {
                               : defaultFlowAuditOutputPrefix(config))
                       << ", jepa_rep_audit="
                       << (config.jepaRepresentationAuditEnabled ? "on" : "off")
+                      << ", temporal_spike_audit="
+                      << (config.temporalSpikeCodeAuditEnabled ? "on" : "off")
+                      << ", temporal_spike_probe="
+                      << (config.temporalSpikeCodeProbeEnabled ? "on" : "off")
+                      << ", temporal_spike_probe_type="
+                      << config.temporalSpikeCodeProbeType
                       << ", jepa_rep_audit_limit=" << config.jepaRepresentationAuditSampleLimit
                       << ", jepa_rep_audit_path="
                       << (defaultJepaRepresentationAuditOutputPath(config).empty()
@@ -13567,6 +15538,7 @@ int main(int argc, char* argv[]) {
 
             if (!config.focusOnly) {
                 std::optional<JepaProbeResult> jepaProbeEval;
+                std::optional<TemporalSpikeCodeProbeResult> temporalSpikeProbeEval;
                 if (config.jepa.probeEnabled) {
                     if (!hasJepaModel) {
                         throw std::runtime_error(
@@ -13581,6 +15553,15 @@ int main(int argc, char* argv[]) {
                         jepaArtifacts.model,
                         "JEPA Probe");
                 }
+                if (config.temporalSpikeCodeProbeEnabled) {
+                    temporalSpikeProbeEval = evaluateTemporalSpikeCodeProbe(
+                        hemispheres,
+                        *trainLoader,
+                        *testLoader,
+                        selectedTestIndices,
+                        config,
+                        "Temporal Spike-Code Probe");
+                }
 
                 auto separabilityRuntime = baseSeparabilityRuntime;
                 auto flowAuditRuntime = baseFlowAuditRuntime;
@@ -13590,12 +15571,14 @@ int main(int argc, char* argv[]) {
                           hemispheres, *testLoader, selectedTestIndices, config,
                           separabilityRuntime.enabled ? &separabilityRuntime : nullptr,
                           flowAuditRuntime.enabled ? &flowAuditRuntime : nullptr,
+                          hasJepaModel ? &jepaArtifacts.model : nullptr,
                           "Testing")
                     : evaluateBilateralPatterns(
                           hemispheres, *testLoader, selectedTestIndices, config, *fusionClassifier,
                           fusionRuntime,
                           separabilityRuntime.enabled ? &separabilityRuntime : nullptr,
                           flowAuditRuntime.enabled ? &flowAuditRuntime : nullptr,
+                          hasJepaModel ? &jepaArtifacts.model : nullptr,
                           "Testing");
                 const double accuracy =
                     100.0 * static_cast<double>(eval.correct) /
@@ -13610,6 +15593,7 @@ int main(int argc, char* argv[]) {
                 printHemisphereAgreementSummary(eval);
                 printHemisphereStage1Summary(eval, config);
                 printBilateralAttributionSummary(eval, config);
+                printTemporalSpikePredictionErrorSummary(eval);
                 printActiveInferenceSummary(eval, config);
                 printFocusAdjustmentSummary(eval);
                 printOnlineCorrectionSummary(eval);
@@ -13643,7 +15627,30 @@ int main(int argc, char* argv[]) {
                     printTopConfusions(jepaProbeEval->confusion, config);
                 }
 
-                if (config.jepaRepresentationAuditEnabled) {
+                if (temporalSpikeProbeEval.has_value()) {
+                    const double temporalProbeAccuracy =
+                        100.0 * static_cast<double>(temporalSpikeProbeEval->correct) /
+                        static_cast<double>(std::max(1, temporalSpikeProbeEval->tested));
+                    std::cout << "\n=== Temporal Spike-Code Probe Results ===" << std::endl;
+                    std::cout << "  Code type: " << config.temporalSpikeCodeProbeType
+                              << std::endl;
+                    std::cout << "  Accuracy: " << std::fixed << std::setprecision(2)
+                              << temporalProbeAccuracy << "%" << std::endl;
+                    std::cout << "  Correct: " << temporalSpikeProbeEval->correct << "/"
+                              << temporalSpikeProbeEval->tested << std::endl;
+                    std::cout << "  Delta vs baseline: " << std::showpos
+                              << std::fixed << std::setprecision(2)
+                              << (temporalProbeAccuracy - accuracy) << " pts" << std::noshowpos
+                              << std::endl;
+                    std::cout << "  Elapsed: " << std::fixed << std::setprecision(2)
+                              << (trainingSeconds + temporalSpikeProbeEval->seconds) << "s"
+                              << std::endl;
+                    printPerClassAccuracy(temporalSpikeProbeEval->confusion, config);
+                    printTopConfusions(temporalSpikeProbeEval->confusion, config);
+                }
+
+                if (config.jepaRepresentationAuditEnabled ||
+                    config.temporalSpikeCodeAuditEnabled) {
                     runJepaRepresentationAudit(
                         hemispheres,
                         *trainLoader,
@@ -13663,12 +15670,14 @@ int main(int argc, char* argv[]) {
                           hemispheres, *testLoader, focusedTestIndices, config,
                           separabilityRuntime.enabled ? &separabilityRuntime : nullptr,
                           flowAuditRuntime.enabled ? &flowAuditRuntime : nullptr,
+                          hasJepaModel ? &jepaArtifacts.model : nullptr,
                           "Focus")
                     : evaluateBilateralPatterns(
                           hemispheres, *testLoader, focusedTestIndices, config, *fusionClassifier,
                           fusionRuntime,
                           separabilityRuntime.enabled ? &separabilityRuntime : nullptr,
                           flowAuditRuntime.enabled ? &flowAuditRuntime : nullptr,
+                          hasJepaModel ? &jepaArtifacts.model : nullptr,
                           "Focus");
                 const double focusedAccuracy =
                     100.0 * static_cast<double>(focusedEval.correct) /
@@ -13684,6 +15693,7 @@ int main(int argc, char* argv[]) {
                 printHemisphereAgreementSummary(focusedEval);
                 printHemisphereStage1Summary(focusedEval, config);
                 printBilateralAttributionSummary(focusedEval, config);
+                printTemporalSpikePredictionErrorSummary(focusedEval);
                 printActiveInferenceSummary(focusedEval, config);
                 printFocusAdjustmentSummary(focusedEval);
                 printOnlineCorrectionSummary(focusedEval);
